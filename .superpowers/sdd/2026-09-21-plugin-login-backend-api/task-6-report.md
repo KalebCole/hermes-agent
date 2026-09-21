@@ -723,3 +723,59 @@ on the 2087 plugin-compat pointers.
 ### Concerns
 
 None.
+
+## Remaining High race — activation versus plugin lifecycle
+
+`PluginContext.set_login_backend_active()` now holds its owning
+`PluginManager._discovery_lock` across provider lookup, ownership validation,
+live registry identity/generation validation, and the complete locked config
+mutation/save. The existing lock is an `RLock`, so activation remains valid
+during plugin registration/discovery.
+
+The resulting lock order is manager discovery lock → plugin-state lock →
+config lock, matching targeted unload and force-rediscovery outer ordering.
+CLI/dashboard disable and remove continue to acquire only plugin-state/config
+locks; because they never wait for the manager lock, concurrent durable
+revocation cannot form a lock cycle, and generation validation still rejects a
+stale activation before mutation.
+
+### TDD evidence
+
+Two event-controlled threaded invariants cover targeted unload and force
+rediscovery in both orderings:
+
+- Activation pauses immediately after exact registry identity validation.
+  Lifecycle acquisition is observed blocking on the manager lock, so it cannot
+  dispose or replace the provider until activation saves. Final targeted-unload
+  state is restored stock; final force-reload state is an active newly
+  registered provider with the original stock snapshot.
+- Lifecycle holds the manager lock first. Activation is observed waiting, then
+  runs after unload/reload and is rejected as stale without changing config.
+
+RED before implementation:
+
+```text
+4 failed, 0 passed
+```
+
+The failures showed lifecycle acquisition was not blocked and activation did
+not attempt the manager lock.
+
+GREEN after implementation:
+
+```text
+4 passed, 0 failed
+```
+
+### Verification evidence
+
+- Focused lifecycle/vault/plugin suites: `243 passed, 0 failed`.
+- Broader plugin suites: `286 passed, 0 failed`.
+- Ruff: all checks passed.
+- `compileall`: exited zero.
+- Compatibility validation: no in-tree dependency on 2,087 pointers.
+- `git diff --check`: exited zero.
+
+### Concerns
+
+None.

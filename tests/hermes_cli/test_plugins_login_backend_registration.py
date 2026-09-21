@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import json
 import shutil
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -1116,6 +1117,182 @@ def _assert_stale_activation_rejected(
     assert login_backend_registry.snapshot_registration(
         "bitwarden", scope=str(config_path.parent.resolve())
     ) is provider
+
+
+class _ObservedRLock:
+    def __init__(self, lock: threading.RLock):
+        self._lock = lock
+        self.lifecycle_attempted = threading.Event()
+        self.lifecycle_blocked = False
+        self.activation_attempted = threading.Event()
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        thread_name = threading.current_thread().name
+        if thread_name == "plugin-lifecycle":
+            acquired = self._lock.acquire(blocking=False)
+            self.lifecycle_blocked = not acquired
+            self.lifecycle_attempted.set()
+            if acquired or not blocking:
+                return acquired
+        elif thread_name == "plugin-activation":
+            self.activation_attempted.set()
+        return self._lock.acquire(blocking, timeout)
+
+    def release(self) -> None:
+        self._lock.release()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.release()
+
+
+@pytest.mark.parametrize("lifecycle", ["targeted", "force"])
+def test_activation_holds_discovery_lock_until_config_save(lifecycle: str):
+    from hermes_cli import plugins_login_backend
+
+    home = Path(os.environ["HERMES_HOME"])
+    manager, module, config_path = _active_replacement_manager(home)
+    module.set_active("bitwarden", False)
+    provider = login_backend_registry.snapshot_registration(
+        "bitwarden", scope=manager.scope_key
+    )
+    observed_lock = _ObservedRLock(manager._discovery_lock)
+    manager._discovery_lock = observed_lock
+    activation_verified = threading.Event()
+    finish_activation = threading.Event()
+    activation_errors: list[BaseException] = []
+    lifecycle_errors: list[BaseException] = []
+
+    original_verify = plugins_login_backend._verify_activation_eligibility
+
+    def pause_after_verify(*args, **kwargs):
+        original_verify(*args, **kwargs)
+        activation_verified.set()
+        assert finish_activation.wait(5)
+
+    def activate():
+        try:
+            module.set_active("bitwarden", True)
+        except BaseException as exc:
+            activation_errors.append(exc)
+
+    def run_lifecycle():
+        try:
+            if lifecycle == "targeted":
+                manager.unload("broker-plugin")
+            else:
+                manager.discover_and_load(force=True)
+        except BaseException as exc:
+            lifecycle_errors.append(exc)
+
+    with patch.object(
+        plugins_login_backend,
+        "_verify_activation_eligibility",
+        side_effect=pause_after_verify,
+    ):
+        activation_thread = threading.Thread(
+            target=activate, name="plugin-activation"
+        )
+        lifecycle_thread = threading.Thread(
+            target=run_lifecycle, name="plugin-lifecycle"
+        )
+        activation_thread.start()
+        assert activation_verified.wait(5)
+        lifecycle_thread.start()
+        try:
+            assert observed_lock.lifecycle_attempted.wait(5)
+            assert observed_lock.lifecycle_blocked is True
+            assert login_backend_registry.snapshot_registration(
+                "bitwarden", scope=manager.scope_key
+            ) is provider
+        finally:
+            finish_activation.set()
+            activation_thread.join(5)
+            lifecycle_thread.join(5)
+
+    assert not activation_thread.is_alive()
+    assert not lifecycle_thread.is_alive()
+    assert activation_errors == []
+    assert lifecycle_errors == []
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    state = raw["plugins"]["entries"]["broker-plugin"]["settings"][
+        "login_backends"
+    ]["bitwarden"]
+    if lifecycle == "targeted":
+        assert state == {"enabled": False}
+        assert raw["vault"]["bitwarden"]["enabled"] == "stock-value"
+        assert login_backend_registry.snapshot_registration(
+            "bitwarden", scope=manager.scope_key
+        ) is None
+    else:
+        assert state["enabled"] is True
+        assert state["prior_stock"] == {"present": True, "value": "stock-value"}
+        assert raw["vault"]["bitwarden"]["enabled"] is False
+        assert login_backend_registry.snapshot_registration(
+            "bitwarden", scope=manager.scope_key
+        ) is not provider
+
+
+@pytest.mark.parametrize("lifecycle", ["targeted", "force"])
+def test_lifecycle_lock_precedes_and_rejects_stale_activation(lifecycle: str):
+    home = Path(os.environ["HERMES_HOME"])
+    manager, module, config_path = _active_replacement_manager(home)
+    module.set_active("bitwarden", False)
+    before = config_path.read_bytes()
+    observed_lock = _ObservedRLock(manager._discovery_lock)
+    manager._discovery_lock = observed_lock
+    lifecycle_locked = threading.Event()
+    finish_lifecycle = threading.Event()
+    activation_done = threading.Event()
+    activation_errors: list[BaseException] = []
+    lifecycle_errors: list[BaseException] = []
+
+    def run_lifecycle():
+        try:
+            with manager._discovery_lock:
+                lifecycle_locked.set()
+                assert finish_lifecycle.wait(5)
+                if lifecycle == "targeted":
+                    manager.unload("broker-plugin")
+                else:
+                    manager.discover_and_load(force=True)
+        except BaseException as exc:
+            lifecycle_errors.append(exc)
+
+    def activate():
+        try:
+            module.set_active("bitwarden", True)
+        except BaseException as exc:
+            activation_errors.append(exc)
+        finally:
+            activation_done.set()
+
+    lifecycle_thread = threading.Thread(
+        target=run_lifecycle, name="plugin-lifecycle"
+    )
+    activation_thread = threading.Thread(
+        target=activate, name="plugin-activation"
+    )
+    lifecycle_thread.start()
+    assert lifecycle_locked.wait(5)
+    activation_thread.start()
+    try:
+        assert observed_lock.activation_attempted.wait(5)
+        assert activation_done.is_set() is False
+    finally:
+        finish_lifecycle.set()
+        lifecycle_thread.join(5)
+        activation_thread.join(5)
+
+    assert not lifecycle_thread.is_alive()
+    assert not activation_thread.is_alive()
+    assert lifecycle_errors == []
+    assert len(activation_errors) == 1
+    assert isinstance(activation_errors[0], PermissionError)
+    assert config_path.read_bytes() == before
 
 
 @pytest.mark.parametrize("surface", ["cli", "dashboard"])

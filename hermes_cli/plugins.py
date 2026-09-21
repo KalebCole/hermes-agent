@@ -614,27 +614,28 @@ class PluginContext:
         """Atomically toggle this plugin's registered stock-backend replacement."""
         from agent.vault_backends import registry as login_backend_registry
 
-        provider = self._login_backend_providers.get(name)
-        if (
-            provider is None
-            or not provider.replaces_stock
-            or provider.owner_plugin_id != self.plugin_id
-        ):
-            raise ValueError(
-                f"Plugin {self.plugin_id!r} has no owned active stock replacement "
-                f"named {name!r}"
-            )
-        if not isinstance(active, bool):
-            raise TypeError("active must be a bool")
+        with self._manager._discovery_lock:
+            provider = self._login_backend_providers.get(name)
+            if (
+                provider is None
+                or not provider.replaces_stock
+                or provider.owner_plugin_id != self.plugin_id
+            ):
+                raise ValueError(
+                    f"Plugin {self.plugin_id!r} has no owned active stock replacement "
+                    f"named {name!r}"
+                )
+            if not isinstance(active, bool):
+                raise TypeError("active must be a bool")
 
-        set_login_backend_active(
-            self.plugin_id,
-            provider.name,
-            active,
-            provider=provider,
-            manifest=self.manifest,
-            scope=self._manager.scope_key,
-        )
+            set_login_backend_active(
+                self.plugin_id,
+                provider.name,
+                active,
+                provider=provider,
+                manifest=self.manifest,
+                scope=self._manager.scope_key,
+            )
 
     def call_mcp(
         self, server: str, tool: str, arguments: Optional[Dict[str, Any]] = None,
