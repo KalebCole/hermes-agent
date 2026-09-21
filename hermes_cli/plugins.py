@@ -26,7 +26,7 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from functools import cached_property
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Mapping, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Optional, Set, Tuple, Union
 
 from hermes_constants import get_hermes_home, get_process_hermes_home, hermes_home_key
 from registration_lifecycle import replacement_coordinator
@@ -63,6 +63,9 @@ from hermes_cli.plugins_state import (
     PluginState, _locked_plugin_state, _nested_plugin_mapping, _nested_plugin_value,
     _plugin_relative_segments, _plugin_settings_entry,
 )
+
+if TYPE_CHECKING:
+    from agent.vault_backends.base import LoginBackend
 
 
 def get_bundled_plugins_dir() -> Path:
@@ -509,6 +512,85 @@ class PluginContext:
         if self.manifest.source == "bundled" and capability == "tools.override":
             return True
         return plugin_capability_granted(self.plugin_id, capability)
+
+    def register_login_backend(
+        self,
+        factory: Callable[[Mapping[str, Any]], "LoginBackend"],
+        *,
+        name: str,
+        display_name: str,
+        prefix: str,
+        needs_unlock: bool = False,
+        replace_stock: bool = False,
+    ) -> PluginRegistration:
+        """Register a profile-scoped browser credential-vault login backend."""
+        from agent.vault_backends import registry as login_backend_registry
+        from agent.vault_backends.registry import LoginBackendProvider
+
+        clean_name = name.strip().lower() if isinstance(name, str) else ""
+        if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", clean_name):
+            raise ValueError("backend name must match [a-z0-9][a-z0-9_-]{0,63}")
+        if not isinstance(display_name, str) or not display_name.strip():
+            raise ValueError("backend display_name must be a non-empty string")
+        if not isinstance(prefix, str) or not prefix.strip():
+            raise ValueError("backend handle prefix must be a non-empty string")
+        if not callable(factory):
+            raise TypeError("login backend factory must be callable")
+
+        stock_prefixes = {
+            "local": "vault_",
+            "onepassword": "op:",
+            "bitwarden": "bw:",
+        }
+        if replace_stock:
+            if not self.has_capability("vault.login_backend_replace"):
+                raise PermissionError(
+                    f"Plugin {self.plugin_id!r} requires capability "
+                    "'vault.login_backend_replace' to replace a stock login backend. "
+                    f"Grant it in plugins.entries.{self.plugin_id}.granted_capabilities."
+                )
+            if clean_name == "local":
+                raise ValueError("cannot replace stock backend 'local'")
+            if clean_name not in {"onepassword", "bitwarden"}:
+                raise ValueError(f"cannot replace non-stock backend {clean_name!r}")
+            expected_prefix = stock_prefixes[clean_name]
+            if prefix != expected_prefix:
+                raise ValueError(
+                    f"stock backend {clean_name!r} requires handle prefix {expected_prefix!r}"
+                )
+        else:
+            if clean_name in stock_prefixes:
+                raise ValueError(f"stock backend name {clean_name!r} is reserved")
+            if prefix in stock_prefixes.values():
+                raise ValueError(f"stock handle prefix {prefix!r} is reserved")
+
+        provider = LoginBackendProvider(
+            name=clean_name,
+            display_name=display_name,
+            prefix=prefix,
+            needs_unlock=bool(needs_unlock),
+            factory=factory,
+            replaces_stock=replace_stock,
+        )
+        scope = self._manager.scope_key
+        previous = login_backend_registry.snapshot_registration(clean_name, scope=scope)
+        login_backend_registry.register_provider(provider, scope=scope)
+        handle = self._manager._track_scoped_registration(
+            self.manifest,
+            "login_backend",
+            clean_name,
+            login_backend_registry,
+            provider,
+            previous,
+        )
+        logger.info(
+            "Plugin %s registered login backend name=%s prefix=%s replacement=%s",
+            self.plugin_id,
+            clean_name,
+            prefix,
+            replace_stock,
+        )
+        return handle
 
     def call_mcp(
         self, server: str, tool: str, arguments: Optional[Dict[str, Any]] = None,
