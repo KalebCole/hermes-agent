@@ -1019,8 +1019,20 @@ or other registration fields.
 
 If `needs_unlock` is true, report the session lock state through
 `is_unlocked()`. While locked, `resolve_password()` raises `UnlockRequired` so
-the interactive surface can ask the user to unlock the source. Do not add an
-unlock tool for the model.
+the interactive surface can ask the user to unlock the source. A backend that
+owns a passwordless login or session-refresh flow can also implement:
+
+```python
+def unlock_noninteractive(self) -> bool:
+    """Try a backend-owned unlock or session refresh without user secret input."""
+    ...
+```
+
+The default returns `False`, preserving the stock interactive flow. Hermes
+calls this no-argument method before reporting a locked backend or prompting,
+and retries `get_meta()` or secret resolution once when either rejects a stale
+session with `UnlockRequired`. The method receives no password, OTP, token, or
+other user secret. Do not add secret fields to browser tool inputs or outputs.
 
 Names must match `[a-z0-9][a-z0-9_-]{0,63}`. Prefixes must be non-empty.
 Hermes rejects a duplicate name, a duplicate prefix, and prefixes that overlap
@@ -1070,6 +1082,27 @@ remain exact: `op:` for 1Password or `bw:` for Bitwarden. A plugin cannot
 replace the local encrypted vault. Stock replacement changes only the external
 login backend. The core browser vault tools, tool schemas, origin checks,
 approval rules, redaction, and fill policy remain host-owned.
+
+The registering plugin can atomically activate or deactivate its replacement:
+
+```python
+def set_login_backend_active(self, name: str, active: bool) -> None:
+    ...
+```
+
+The call is valid only for the calling plugin's currently registered
+`replace_stock=True` provider. Activation writes
+`plugins.entries.<plugin_id>.settings.login_backend_enabled: true` and
+`vault.<name>.enabled: false`; deactivation writes the inverse. The provider
+registry records the owner, and selection uses the replacement unless that
+owner setting is explicitly `false`. While the replacement is active, the
+stock vault's disabled flag does not suppress it.
+
+Both affected dotted paths must be writable under managed-scope policy, and
+managed installs reject the operation. Hermes holds the existing plugin-state
+and config locks across a fail-closed raw read and one merge save, so unrelated
+configuration survives. Malformed YAML, policy rejection, or save failure
+raises without changing `config.yaml`; there is no silent fallback.
 
 ### Register multiple hooks
 

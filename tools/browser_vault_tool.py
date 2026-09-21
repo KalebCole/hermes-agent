@@ -218,6 +218,12 @@ def browser_vault_list() -> str:
     items, locked, errors = [], [], []
     for backend in enabled_backends():
         if backend.needs_unlock and not backend.is_unlocked():
+            try:
+                backend.unlock_noninteractive()
+            except Exception as exc:
+                errors.append({"backend": backend.name, "error": str(exc)[:200]})
+                continue
+        if backend.needs_unlock and not backend.is_unlocked():
             locked.append({"backend": backend.name, "display_name": backend.display_name,
                            "unlock": "browser_vault_unlock" if can_prompt_here() else "unavailable_in_this_session"})
             continue
@@ -258,6 +264,11 @@ def browser_vault_unlock(backend_name: str) -> str:
         return json.dumps({"success": False, "error": f"No unlockable vault backend named {backend_name!r}."})
     if backend.is_unlocked():
         return json.dumps({"success": True, "backend": backend.name, "already_unlocked": True})
+    try:
+        if backend.unlock_noninteractive():
+            return json.dumps({"success": True, "backend": backend.name})
+    except Exception as exc:
+        return json.dumps({"success": False, "error_type": "unlock_failed", "error": str(exc)[:300]})
     if not can_prompt_here():
         return json.dumps({"success": False, "error_type": "unlock_unavailable",
                            "error": (f"{backend.display_name} is locked and this session cannot prompt for the "
@@ -418,8 +429,14 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
     try:
         meta = backend.get_meta(handle) if backend is not None else None
     except UnlockRequired:
-        return json.dumps({"success": False, "error_type": "unlock_required",
-                           "error": f"{backend.display_name} locked again; call browser_vault_unlock."})
+        if not backend.unlock_noninteractive():
+            return json.dumps({"success": False, "error_type": "unlock_required",
+                               "error": f"{backend.display_name} locked again; call browser_vault_unlock."})
+        try:
+            meta = backend.get_meta(handle)
+        except UnlockRequired:
+            return json.dumps({"success": False, "error_type": "unlock_required",
+                               "error": f"{backend.display_name} locked again; call browser_vault_unlock."})
     if meta is None:
         return json.dumps(
             {
@@ -500,8 +517,23 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None) -> str:
             secret = backend.resolve_secret(handle)
             fills = select_checkout_fills(classified, secret, PAYMENT_FIELDS if meta.kind == "payment" else ADDRESS_FIELDS)
     except UnlockRequired:
-        return json.dumps({"success": False, "error_type": "unlock_required",
-                           "error": f"{backend.display_name} locked again; call browser_vault_unlock."})
+        if not backend.unlock_noninteractive():
+            return json.dumps({"success": False, "error_type": "unlock_required",
+                               "error": f"{backend.display_name} locked again; call browser_vault_unlock."})
+        try:
+            if meta.kind == "login":
+                secret = {"password": backend.resolve_password(handle)}
+                fills = select_password_fill(classified, secret["password"])
+            else:
+                secret = backend.resolve_secret(handle)
+                fills = select_checkout_fills(
+                    classified,
+                    secret,
+                    PAYMENT_FIELDS if meta.kind == "payment" else ADDRESS_FIELDS,
+                )
+        except UnlockRequired:
+            return json.dumps({"success": False, "error_type": "unlock_required",
+                               "error": f"{backend.display_name} locked again; call browser_vault_unlock."})
     if not fills:
         return json.dumps(
             {"success": False, "error": f"No fillable {meta.kind} field matched the saved item on this page."}

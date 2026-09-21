@@ -40,6 +40,10 @@ class LoginBackend(ABC):
     def is_unlocked(self) -> bool:
         return True
 
+    def unlock_noninteractive(self) -> bool:
+        """Try a backend-owned unlock or session refresh without user secret input."""
+        return False
+
     @abstractmethod
     def list_items(self) -> List[VaultItemMeta]:
         """Metadata only. Locked external backends return [] (the agent sees a lock hint instead)."""
@@ -132,7 +136,7 @@ def available_backend_providers() -> tuple["LoginBackendProvider", ...]:
     replacements = {
         provider.name: provider
         for provider in plugin_providers
-        if provider.replaces_stock
+        if provider.replaces_stock and _replacement_is_active(provider)
     }
     providers = [
         replacements.get(provider.name, provider)
@@ -149,6 +153,22 @@ def available_backend_providers() -> tuple["LoginBackendProvider", ...]:
         )
     )
     return tuple(providers)
+
+
+def _replacement_is_active(provider: "LoginBackendProvider") -> bool:
+    if not provider.replaces_stock or provider.owner_plugin_id is None:
+        return False
+    from hermes_cli.config import load_config_readonly
+
+    config = load_config_readonly() or {}
+    plugins = config.get("plugins")
+    entries = plugins.get("entries") if isinstance(plugins, dict) else None
+    entry = entries.get(provider.owner_plugin_id) if isinstance(entries, dict) else None
+    settings = entry.get("settings") if isinstance(entry, dict) else None
+    return not (
+        isinstance(settings, dict)
+        and settings.get("login_backend_enabled") is False
+    )
 
 
 def is_installed(name: str) -> bool:
@@ -190,7 +210,11 @@ def enabled_backends() -> List[LoginBackend]:
     out: List[LoginBackend] = [LocalLoginBackend()]
     for provider in available_backend_providers():
         section = cfg.get(provider.name) or {}
-        if isinstance(section, dict) and section.get("enabled") is False:
+        if (
+            not _replacement_is_active(provider)
+            and isinstance(section, dict)
+            and section.get("enabled") is False
+        ):
             continue
         if not provider_is_installed(provider):
             continue

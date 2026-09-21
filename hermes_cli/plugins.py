@@ -578,6 +578,7 @@ class PluginContext:
             needs_unlock=bool(needs_unlock),
             factory=factory,
             replaces_stock=replace_stock,
+            owner_plugin_id=self.plugin_id,
         )
         scope = self._manager.scope_key
         previous = login_backend_registry.snapshot_registration(clean_name, scope=scope)
@@ -598,6 +599,64 @@ class PluginContext:
             replace_stock,
         )
         return handle
+
+    def set_login_backend_active(self, name: str, active: bool) -> None:
+        """Atomically toggle this plugin's registered stock-backend replacement."""
+        from agent.vault_backends import registry as login_backend_registry
+        from hermes_cli import config as config_mod
+        from hermes_cli import managed_scope
+
+        provider = login_backend_registry.snapshot_registration(
+            name, scope=self._manager.scope_key
+        )
+        if (
+            provider is None
+            or not provider.replaces_stock
+            or provider.owner_plugin_id != self.plugin_id
+        ):
+            raise ValueError(
+                f"Plugin {self.plugin_id!r} has no owned active stock replacement "
+                f"named {name!r}"
+            )
+        if not isinstance(active, bool):
+            raise TypeError("active must be a bool")
+
+        plugin_path = (
+            "plugins",
+            "entries",
+            self.plugin_id,
+            "settings",
+            "login_backend_enabled",
+        )
+        vault_path = ("vault", provider.name, "enabled")
+        config_path = config_mod.get_config_path()
+        with _locked_plugin_state(config_path), config_mod._CONFIG_LOCK:
+            if config_mod.is_managed():
+                raise PermissionError(
+                    "Login backend activation cannot be changed in a managed install"
+                )
+            for path in (plugin_path, vault_path):
+                dotted_path = ".".join(path)
+                if managed_scope.is_key_managed(dotted_path):
+                    raise PermissionError(
+                        f"Login backend setting {dotted_path!r} is administrator-managed"
+                    )
+            config_mod.read_user_config_raw(config_path)
+            partial = {
+                "plugins": {
+                    "entries": {
+                        self.plugin_id: {
+                            "settings": {"login_backend_enabled": active}
+                        }
+                    }
+                },
+                "vault": {provider.name: {"enabled": not active}},
+            }
+            config_mod.save_config(
+                partial,
+                preserve_keys={plugin_path, vault_path},
+                merge_existing=True,
+            )
 
     def call_mcp(
         self, server: str, tool: str, arguments: Optional[Dict[str, Any]] = None,

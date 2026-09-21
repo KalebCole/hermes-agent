@@ -21,6 +21,7 @@ class LoginBackendProvider:
     needs_unlock: bool
     factory: LoginBackendFactory
     replaces_stock: bool = False
+    owner_plugin_id: str | None = None
 
     def create(self, config: Mapping[str, Any]) -> LoginBackend:
         backend = self.factory(config)

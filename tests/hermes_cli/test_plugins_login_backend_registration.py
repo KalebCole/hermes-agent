@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -36,6 +37,187 @@ class {class_name}(LoginBackend):
     def resolve_password(self, handle):
         return ""
 """
+
+
+def _write_noninteractive_plugin(home: Path, *, rejection: str = "") -> None:
+    plugin_dir = home / "plugins" / "broker-plugin"
+    plugin_dir.mkdir(parents=True)
+    (plugin_dir / "plugin.yaml").write_text(
+        "name: broker-plugin\nversion: 0.1.0\n", encoding="utf-8"
+    )
+    (plugin_dir / "__init__.py").write_text(
+        f"""
+from agent.vault_backends.base import LoginBackend, UnlockRequired
+from agent.vault_store import VaultItemMeta
+
+session_valid = {bool(rejection)!r}
+unlock_calls = 0
+rejection = {rejection!r}
+rejected = False
+
+class BrokerBackend(LoginBackend):
+    name = "broker"
+    display_name = "Broker vault"
+    prefix = "broker:"
+    needs_unlock = True
+
+    def __init__(self, config):
+        self.config = config
+
+    def is_unlocked(self):
+        return session_valid
+
+    def unlock_noninteractive(self):
+        global session_valid, unlock_calls
+        session_valid = True
+        unlock_calls += 1
+        return True
+
+    def list_items(self):
+        if not session_valid:
+            return []
+        return [self._meta()]
+
+    def get_meta(self, handle):
+        global rejected
+        if rejection == "get_meta" and not rejected:
+            rejected = True
+            raise UnlockRequired(self)
+        return self._meta() if handle == "broker:item" else None
+
+    def resolve_password(self, handle):
+        global rejected
+        if rejection == "resolve_password" and not rejected:
+            rejected = True
+            raise UnlockRequired(self)
+        return "plugin-secret"
+
+    @staticmethod
+    def _meta():
+        return VaultItemMeta(
+            id="broker:item",
+            kind="login",
+            label="Broker login",
+            origin="https://example.com",
+            created_at="2026-09-21T00:00:00Z",
+            identifier_type="email",
+            identifier="user@example.com",
+            allowed_origins=("https://example.com",),
+        )
+
+def register(ctx):
+    ctx.register_login_backend(
+        BrokerBackend,
+        name="broker",
+        display_name="Broker vault",
+        prefix="broker:",
+        needs_unlock=True,
+    )
+""",
+        encoding="utf-8",
+    )
+
+
+def _discover_noninteractive_plugin(home: Path, *, rejection: str = ""):
+    _write_noninteractive_plugin(home, rejection=rejection)
+    _configure_plugins(home, ["broker-plugin"])
+    manager = PluginManager()
+    manager.discover_and_load()
+    module = manager._plugins["broker-plugin"].module
+    assert module is not None
+    return module
+
+
+def test_noninteractive_list_refreshes_plugin_backend_without_prompt():
+    from tools.browser_vault_tool import browser_vault_list
+
+    home = Path(os.environ["HERMES_HOME"])
+    module = _discover_noninteractive_plugin(home)
+
+    with patch("agent.vault_backends.base.is_installed", return_value=False), patch(
+        "agent.vault_backends.unlock.can_prompt_here", return_value=False
+    ):
+        result = json.loads(browser_vault_list())
+
+    assert result["items"] == [
+        {
+            "handle": "broker:item",
+            "backend": "broker",
+            "label": "Broker login",
+            "kind": "login",
+            "origin": "https://example.com",
+            "available": True,
+            "two_factor": (
+                "automatic if the manager stores a TOTP seed, else the user is asked"
+            ),
+            "identifier": "user@example.com",
+            "identifier_type": "email",
+        }
+    ]
+    assert "locked" not in result
+    assert module.unlock_calls == 1
+
+
+def test_noninteractive_unlock_succeeds_in_headless_session_without_secret():
+    from tools.browser_vault_tool import browser_vault_unlock
+
+    home = Path(os.environ["HERMES_HOME"])
+    module = _discover_noninteractive_plugin(home)
+
+    with patch("agent.vault_backends.base.is_installed", return_value=False), patch(
+        "agent.vault_backends.unlock.can_prompt_here", return_value=False
+    ):
+        result = json.loads(browser_vault_unlock("broker"))
+
+    assert result == {"success": True, "backend": "broker"}
+    assert module.unlock_calls == 1
+
+
+@pytest.mark.parametrize("rejection", ["get_meta", "resolve_password"])
+def test_noninteractive_fill_refreshes_rejected_session_once(rejection: str):
+    from tools import browser_vault_tool
+
+    home = Path(os.environ["HERMES_HOME"])
+    module = _discover_noninteractive_plugin(home, rejection=rejection)
+    controls = [
+        {
+            "autocomplete": "current-password",
+            "formIndex": 0,
+            "index": 0,
+            "label": "",
+            "name": "password",
+            "type": "password",
+        }
+    ]
+
+    with patch("agent.vault_backends.base.is_installed", return_value=False), patch.object(
+        browser_vault_tool,
+        "_focus_bound_origin",
+        return_value="https://example.com",
+    ), patch.object(
+        browser_vault_tool,
+        "_eval_js",
+        return_value={"success": True, "result": json.dumps(controls)},
+    ), patch.object(
+        browser_vault_tool,
+        "_eval_js_secret",
+        return_value={"success": True, "result": json.dumps({"filled": 1})},
+    ):
+        raw = browser_vault_tool.browser_vault_fill("broker:item")
+
+    result = json.loads(raw)
+    assert result["success"] is True
+    assert result["backend"] == "broker"
+    assert module.unlock_calls == 1
+    assert "plugin-secret" not in raw
+
+
+def test_noninteractive_default_preserves_stock_bitwarden_interactive_unlock():
+    from agent.vault_backends.bitwarden import BitwardenLoginBackend
+
+    backend = BitwardenLoginBackend({})
+
+    assert backend.unlock_noninteractive() is False
 
 
 @pytest.fixture(autouse=True)
@@ -79,6 +261,8 @@ def _write_plugin(
     source += f"""
 
 def register(ctx):
+    global plugin_context
+    plugin_context = ctx
     ctx.register_login_backend(
         {class_name},
         name={backend_name!r},
@@ -87,6 +271,9 @@ def register(ctx):
         needs_unlock={needs_unlock!r},
         replace_stock={replace_stock!r},
     )
+
+def set_active(name, active):
+    plugin_context.set_login_backend_active(name, active)
 """
     (plugin_dir / "__init__.py").write_text(source, encoding="utf-8")
 
@@ -455,6 +642,261 @@ def test_granted_capability_allows_exact_stock_replacement():
     assert provider is not None
     assert provider.replaces_stock is True
     assert provider.prefix == "bw:"
+
+
+def test_replacement_activation_transaction_preserves_unrelated_config():
+    home = Path(os.environ["HERMES_HOME"])
+    _write_plugin(
+        home,
+        "broker-plugin",
+        backend_name="bitwarden",
+        display_name="Broker Bitwarden",
+        prefix="bw:",
+        needs_unlock=True,
+        replace_stock=True,
+        class_name="BrokerBitwardenBackend",
+    )
+    _configure_plugins(
+        home,
+        ["broker-plugin"],
+        grants={"broker-plugin": ["vault.login_backend_replace"]},
+        vault={"bitwarden": {"enabled": True, "endpoint": "https://vault.invalid"}},
+    )
+    path = home / "config.yaml"
+    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    raw["plugins"]["entries"]["broker-plugin"]["settings"] = {"unrelated": "keep"}
+    raw["display"] = {"skin": "slate"}
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+
+    manager = PluginManager()
+    manager.discover_and_load()
+    module = manager._plugins["broker-plugin"].module
+
+    module.set_active("bitwarden", True)
+    active = yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert active["plugins"]["entries"]["broker-plugin"]["settings"] == {
+        "login_backend_enabled": True,
+        "unrelated": "keep",
+    }
+    assert active["vault"]["bitwarden"] == {
+        "enabled": False,
+        "endpoint": "https://vault.invalid",
+    }
+    assert active["display"] == {"skin": "slate"}
+
+    module.set_active("bitwarden", False)
+    inactive = yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert inactive["plugins"]["entries"]["broker-plugin"]["settings"][
+        "login_backend_enabled"
+    ] is False
+    assert inactive["vault"]["bitwarden"]["enabled"] is True
+
+
+def test_replacement_selection_uses_owner_setting_not_stock_enabled_flag():
+    home = Path(os.environ["HERMES_HOME"])
+    _write_plugin(
+        home,
+        "broker-plugin",
+        backend_name="bitwarden",
+        display_name="Broker Bitwarden",
+        prefix="bw:",
+        replace_stock=True,
+        class_name="BrokerBitwardenBackend",
+    )
+    _configure_plugins(
+        home,
+        ["broker-plugin"],
+        grants={"broker-plugin": ["vault.login_backend_replace"]},
+        vault={"bitwarden": {"enabled": False}},
+    )
+    manager = PluginManager()
+    manager.discover_and_load()
+    module = manager._plugins["broker-plugin"].module
+
+    with patch("agent.vault_backends.base.is_installed", return_value=True):
+        active = next(
+            backend for backend in enabled_backends() if backend.name == "bitwarden"
+        )
+        assert active.display_name == "Broker Bitwarden"
+
+        module.set_active("bitwarden", False)
+        inactive = next(
+            backend for backend in enabled_backends() if backend.name == "bitwarden"
+        )
+        assert inactive.display_name == "Bitwarden"
+
+
+@pytest.mark.parametrize(
+    "managed_path",
+    [
+        "plugins.entries.broker-plugin.settings.login_backend_enabled",
+        "vault.bitwarden.enabled",
+    ],
+)
+def test_replacement_activation_rejects_managed_paths_without_writing(
+    managed_path: str,
+):
+    from hermes_cli import managed_scope
+
+    home = Path(os.environ["HERMES_HOME"])
+    _write_plugin(
+        home,
+        "broker-plugin",
+        backend_name="bitwarden",
+        display_name="Broker Bitwarden",
+        prefix="bw:",
+        replace_stock=True,
+        class_name="BrokerBitwardenBackend",
+    )
+    _configure_plugins(
+        home,
+        ["broker-plugin"],
+        grants={"broker-plugin": ["vault.login_backend_replace"]},
+    )
+    manager = PluginManager()
+    manager.discover_and_load()
+    module = manager._plugins["broker-plugin"].module
+    path = home / "config.yaml"
+    before = path.read_bytes()
+
+    with patch.object(
+        managed_scope, "is_key_managed", side_effect=lambda key: key == managed_path
+    ), pytest.raises(PermissionError, match="administrator-managed"):
+        module.set_active("bitwarden", True)
+
+    assert path.read_bytes() == before
+
+
+def test_replacement_activation_rejects_managed_install_without_writing():
+    from hermes_cli import config as config_mod
+
+    home = Path(os.environ["HERMES_HOME"])
+    _write_plugin(
+        home,
+        "broker-plugin",
+        backend_name="bitwarden",
+        display_name="Broker Bitwarden",
+        prefix="bw:",
+        replace_stock=True,
+        class_name="BrokerBitwardenBackend",
+    )
+    _configure_plugins(
+        home,
+        ["broker-plugin"],
+        grants={"broker-plugin": ["vault.login_backend_replace"]},
+    )
+    manager = PluginManager()
+    manager.discover_and_load()
+    module = manager._plugins["broker-plugin"].module
+    path = home / "config.yaml"
+    before = path.read_bytes()
+
+    with patch.object(config_mod, "is_managed", return_value=True), pytest.raises(
+        PermissionError, match="managed install"
+    ):
+        module.set_active("bitwarden", True)
+
+    assert path.read_bytes() == before
+
+
+def test_replacement_activation_parse_failure_leaves_config_unchanged():
+    home = Path(os.environ["HERMES_HOME"])
+    _write_plugin(
+        home,
+        "broker-plugin",
+        backend_name="bitwarden",
+        display_name="Broker Bitwarden",
+        prefix="bw:",
+        replace_stock=True,
+        class_name="BrokerBitwardenBackend",
+    )
+    _configure_plugins(
+        home,
+        ["broker-plugin"],
+        grants={"broker-plugin": ["vault.login_backend_replace"]},
+    )
+    manager = PluginManager()
+    manager.discover_and_load()
+    module = manager._plugins["broker-plugin"].module
+    path = home / "config.yaml"
+    broken = "plugins:\n  entries: [unterminated\n"
+    path.write_text(broken, encoding="utf-8")
+
+    with pytest.raises(Exception, match="while parsing|expected"):
+        module.set_active("bitwarden", True)
+
+    assert path.read_text(encoding="utf-8") == broken
+
+
+def test_replacement_activation_save_failure_leaves_config_unchanged():
+    from hermes_cli import config as config_mod
+
+    home = Path(os.environ["HERMES_HOME"])
+    _write_plugin(
+        home,
+        "broker-plugin",
+        backend_name="bitwarden",
+        display_name="Broker Bitwarden",
+        prefix="bw:",
+        replace_stock=True,
+        class_name="BrokerBitwardenBackend",
+    )
+    _configure_plugins(
+        home,
+        ["broker-plugin"],
+        grants={"broker-plugin": ["vault.login_backend_replace"]},
+    )
+    manager = PluginManager()
+    manager.discover_and_load()
+    module = manager._plugins["broker-plugin"].module
+    path = home / "config.yaml"
+    before = path.read_bytes()
+
+    with patch.object(config_mod, "save_config", side_effect=OSError("disk full")), pytest.raises(
+        OSError, match="disk full"
+    ):
+        module.set_active("bitwarden", True)
+
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    ("backend_name", "replace_stock"),
+    [("broker", False), ("bitwarden", True)],
+)
+def test_plugin_cannot_activate_unowned_or_nonreplacement_backend(
+    backend_name: str,
+    replace_stock: bool,
+):
+    home = Path(os.environ["HERMES_HOME"])
+    owner = "owner-plugin" if replace_stock else "caller-plugin"
+    _write_plugin(
+        home,
+        owner,
+        backend_name=backend_name,
+        display_name="Owned backend",
+        prefix="bw:" if replace_stock else "broker:",
+        replace_stock=replace_stock,
+        class_name="OwnedBackend",
+    )
+    plugin_ids = [owner]
+    grants = {owner: ["vault.login_backend_replace"]} if replace_stock else {}
+    if replace_stock:
+        _write_plugin(
+            home,
+            "caller-plugin",
+            backend_name="caller",
+            display_name="Caller backend",
+            prefix="caller:",
+        )
+        plugin_ids.append("caller-plugin")
+    _configure_plugins(home, plugin_ids, grants=grants)
+    manager = PluginManager()
+    manager.discover_and_load()
+    caller = manager._plugins["caller-plugin"].module
+
+    with pytest.raises(ValueError, match="owned active stock replacement"):
+        caller.set_active(backend_name, True)
 
 
 def test_login_backend_stock_replacement_occupies_stock_slot_without_changing_tools():
