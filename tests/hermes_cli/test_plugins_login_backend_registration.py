@@ -842,6 +842,38 @@ def test_repeated_replacement_activation_does_not_replace_snapshot_or_write():
     ]["bitwarden"]["prior_stock"] == {"present": True, "value": True}
 
 
+@pytest.mark.parametrize(
+    "prior_stock",
+    [
+        pytest.param(None, id="absent"),
+        pytest.param({"present": True}, id="invalid"),
+    ],
+)
+def test_repeated_replacement_activation_requires_valid_snapshot_without_writing(
+    prior_stock: object,
+):
+    from hermes_cli import config as config_mod
+
+    module, config_path = _replacement_activation_subject()
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    state = raw["plugins"]["entries"]["broker-plugin"].setdefault(
+        "settings", {}
+    ).setdefault("login_backends", {}).setdefault("bitwarden", {})
+    state["enabled"] = True
+    if prior_stock is not None:
+        state["prior_stock"] = prior_stock
+    config_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    before = config_path.read_bytes()
+
+    with patch.object(config_mod, "save_config") as save_config, pytest.raises(
+        (TypeError, ValueError), match="login_backends.bitwarden.prior_stock"
+    ):
+        module.set_active("bitwarden", True)
+
+    save_config.assert_not_called()
+    assert config_path.read_bytes() == before
+
+
 def test_repeated_replacement_deactivation_does_not_overwrite_later_user_change():
     home = Path(os.environ["HERMES_HOME"])
     _write_plugin(
@@ -1176,6 +1208,70 @@ def test_force_reload_omitting_active_replacement_restores_stock():
     _assert_bitwarden_replacement_cleaned(config_path)
 
 
+def test_force_reload_omitting_owner_rejects_managed_install_without_mutation():
+    from hermes_cli import config as config_mod
+
+    home = Path(os.environ["HERMES_HOME"])
+    manager, _, config_path = _active_dual_replacement_manager(home)
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    raw["plugins"]["enabled"] = []
+    config_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    before = config_path.read_bytes()
+    provider_before = login_backend_registry.snapshot_registration(
+        "bitwarden", scope=manager.scope_key
+    )
+
+    with patch.object(config_mod, "is_managed", return_value=True), pytest.raises(
+        PermissionError, match="managed install"
+    ):
+        manager.discover_and_load(force=True)
+
+    assert config_path.read_bytes() == before
+    assert (
+        login_backend_registry.snapshot_registration(
+            "bitwarden", scope=manager.scope_key
+        )
+        is provider_before
+    )
+
+
+@pytest.mark.parametrize(
+    "managed_path",
+    [
+        "plugins.entries.dual-broker.settings.login_backends.bitwarden.enabled",
+        "plugins.entries.dual-broker.settings.login_backends.bitwarden.prior_stock",
+        "vault.bitwarden.enabled",
+    ],
+)
+def test_force_reload_omitting_owner_rejects_managed_paths_without_mutation(
+    managed_path: str,
+):
+    from hermes_cli import managed_scope
+
+    home = Path(os.environ["HERMES_HOME"])
+    manager, _, config_path = _active_dual_replacement_manager(home)
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    raw["plugins"]["enabled"] = []
+    config_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    before = config_path.read_bytes()
+    provider_before = login_backend_registry.snapshot_registration(
+        "bitwarden", scope=manager.scope_key
+    )
+
+    with patch.object(
+        managed_scope, "is_key_managed", side_effect=lambda key: key == managed_path
+    ), pytest.raises(PermissionError, match="administrator-managed"):
+        manager.discover_and_load(force=True)
+
+    assert config_path.read_bytes() == before
+    assert (
+        login_backend_registry.snapshot_registration(
+            "bitwarden", scope=manager.scope_key
+        )
+        is provider_before
+    )
+
+
 def test_failed_force_reload_restores_stock_and_consumes_snapshot():
     home = Path(os.environ["HERMES_HOME"])
     manager, _, config_path = _active_dual_replacement_manager(home)
@@ -1291,6 +1387,43 @@ def test_force_reload_hands_original_snapshot_to_different_active_owner():
     assert login_backend_registry.snapshot_registration(
         "bitwarden", scope=manager.scope_key
     ).owner_plugin_id == "owner-b"
+
+
+@pytest.mark.parametrize(
+    "managed_path",
+    [
+        "plugins.entries.owner-a.settings.login_backends.bitwarden.enabled",
+        "plugins.entries.owner-a.settings.login_backends.bitwarden.prior_stock",
+        "plugins.entries.owner-b.settings.login_backends.bitwarden.enabled",
+        "plugins.entries.owner-b.settings.login_backends.bitwarden.prior_stock",
+        "vault.bitwarden.enabled",
+    ],
+)
+def test_force_reload_handoff_rejects_managed_paths_without_mutation(
+    managed_path: str,
+):
+    from hermes_cli import managed_scope
+
+    manager, config_path = _prepare_different_owner_handoff(
+        Path(os.environ["HERMES_HOME"])
+    )
+    before = config_path.read_bytes()
+    provider_before = login_backend_registry.snapshot_registration(
+        "bitwarden", scope=manager.scope_key
+    )
+
+    with patch.object(
+        managed_scope, "is_key_managed", side_effect=lambda key: key == managed_path
+    ), pytest.raises(PermissionError, match="administrator-managed"):
+        manager.discover_and_load(force=True)
+
+    assert config_path.read_bytes() == before
+    assert (
+        login_backend_registry.snapshot_registration(
+            "bitwarden", scope=manager.scope_key
+        )
+        is provider_before
+    )
 
 
 def test_different_owner_handoff_later_unload_restores_original_stock():

@@ -23,6 +23,15 @@ class LoginBackendCarryover:
     prior_stock: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class _CarryoverAction:
+    active_path: tuple[str, ...]
+    rollback_path: tuple[str, ...]
+    vault_path: tuple[str, ...]
+    prior_stock: dict[str, Any]
+    new_rollback_path: tuple[str, ...] | None = None
+
+
 def state_paths(
     plugin_id: str, backend_name: str
 ) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
@@ -107,10 +116,55 @@ def _validate_parent_path(raw: Mapping[str, Any], path: tuple[str, ...]) -> None
         )
 
 
+def _reject_managed_writes(paths: set[tuple[str, ...]]) -> None:
+    from hermes_cli import config as config_mod
+    from hermes_cli import managed_scope
+
+    if config_mod.is_managed():
+        raise PermissionError(
+            "Login backend activation cannot be changed in a managed install"
+        )
+    for path in sorted(paths):
+        dotted_path = ".".join(path)
+        if managed_scope.is_key_managed(dotted_path):
+            raise PermissionError(
+                f"Login backend setting {dotted_path!r} is administrator-managed"
+            )
+
+
+def _validate_carryover_policy(carryovers: list[LoginBackendCarryover]) -> None:
+    """Reject a force reload before registrations move if reconciliation may be managed."""
+    from hermes_cli import config as config_mod
+
+    if not carryovers:
+        return
+    raw = config_mod.require_readable_config_before_write(
+        config_mod.get_config_path()
+    )
+    missing = object()
+    paths: set[tuple[str, ...]] = set()
+    entries = raw_value(raw, ("plugins", "entries"), missing)
+    for carryover in carryovers:
+        active_path, rollback_path, vault_path = state_paths(
+            carryover.plugin_id, carryover.backend_name
+        )
+        paths.update({active_path, rollback_path, vault_path})
+        if not isinstance(entries, Mapping):
+            continue
+        for plugin_id in entries:
+            if plugin_id == carryover.plugin_id:
+                continue
+            new_active_path, new_rollback_path, _ = state_paths(
+                str(plugin_id), carryover.backend_name
+            )
+            if raw_value(raw, new_active_path, missing) is True:
+                paths.update({new_active_path, new_rollback_path})
+    _reject_managed_writes(paths)
+
+
 def restore_plugin_leases(plugin_id: str) -> bool:
     """Restore every persisted active stock-backend lease owned by ``plugin_id``."""
     from hermes_cli import config as config_mod
-    from hermes_cli import managed_scope
 
     config_path = config_mod.get_config_path()
     with _locked_plugin_state(config_path), config_mod._CONFIG_LOCK:
@@ -177,18 +231,12 @@ def restore_plugin_leases(plugin_id: str) -> bool:
 
         if not active_leases:
             return False
-        if config_mod.is_managed():
-            raise PermissionError(
-                "Login backend activation cannot be changed in a managed install"
-            )
-        for active_path, rollback_path, vault_path, _ in active_leases:
-            for path in (active_path, rollback_path, vault_path):
-                dotted_path = ".".join(path)
-                if managed_scope.is_key_managed(dotted_path):
-                    raise PermissionError(
-                        f"Login backend setting {dotted_path!r} is "
-                        "administrator-managed"
-                    )
+        writable_paths = {
+            path
+            for active_path, rollback_path, vault_path, _ in active_leases
+            for path in (active_path, rollback_path, vault_path)
+        }
+        _reject_managed_writes(writable_paths)
 
         for active_path, rollback_path, vault_path, snapshot in active_leases:
             set_raw_value(raw, active_path, False)
@@ -208,21 +256,11 @@ def restore_plugin_leases(plugin_id: str) -> bool:
 
 def set_active(plugin_id: str, backend_name: str, active: bool) -> None:
     from hermes_cli import config as config_mod
-    from hermes_cli import managed_scope
 
     active_path, rollback_path, vault_path = state_paths(plugin_id, backend_name)
     config_path = config_mod.get_config_path()
     with _locked_plugin_state(config_path), config_mod._CONFIG_LOCK:
-        if config_mod.is_managed():
-            raise PermissionError(
-                "Login backend activation cannot be changed in a managed install"
-            )
-        for path in (active_path, rollback_path, vault_path):
-            dotted_path = ".".join(path)
-            if managed_scope.is_key_managed(dotted_path):
-                raise PermissionError(
-                    f"Login backend setting {dotted_path!r} is administrator-managed"
-                )
+        _reject_managed_writes({active_path, rollback_path, vault_path})
         try:
             raw = config_mod.require_readable_config_before_write(config_path)
         except RuntimeError as exc:
@@ -244,6 +282,9 @@ def set_active(plugin_id: str, backend_name: str, active: bool) -> None:
 
         snapshot = raw_value(raw, rollback_path, missing)
         if snapshot is not missing:
+            validate_snapshot(snapshot, rollback_path, missing)
+
+        if active and current is True and snapshot is missing:
             validate_snapshot(snapshot, rollback_path, missing)
 
         if current is active:
@@ -348,7 +389,8 @@ def restore_carryovers(
     with _locked_plugin_state(config_path), config_mod._CONFIG_LOCK:
         raw = config_mod.require_readable_config_before_write(config_path)
         missing = object()
-        changed = False
+        actions: list[_CarryoverAction] = []
+        writable_paths: set[tuple[str, ...]] = set()
         for carryover in carryovers:
             current_provider = login_backend_registry.snapshot_registration(
                 carryover.backend_name, scope=carryover.scope
@@ -356,6 +398,7 @@ def restore_carryovers(
             active_path, rollback_path, vault_path = state_paths(
                 carryover.plugin_id, carryover.backend_name
             )
+            validate_snapshot(carryover.prior_stock, rollback_path, missing)
             current_active = raw_value(raw, active_path, missing)
             current_snapshot = raw_value(raw, rollback_path, missing)
             if current_active is not missing and type(current_active) is not bool:
@@ -404,33 +447,65 @@ def restore_carryovers(
                             f"Login backend snapshot "
                             f"{'.'.join(new_rollback_path)!r} is stale"
                         )
-                    set_raw_value(raw, active_path, False)
-                    old_state = raw_value(raw, rollback_path[:-1], missing)
-                    if isinstance(old_state, dict):
-                        old_state.pop(rollback_path[-1], None)
-                    set_raw_value(
-                        raw,
-                        new_rollback_path,
-                        copy.deepcopy(carryover.prior_stock),
+                    writable_paths.update(
+                        {
+                            active_path,
+                            rollback_path,
+                            new_active_path,
+                            new_rollback_path,
+                            vault_path,
+                        }
                     )
-                    set_raw_value(raw, vault_path, False)
-                    changed = True
+                    actions.append(
+                        _CarryoverAction(
+                            active_path=active_path,
+                            rollback_path=rollback_path,
+                            vault_path=vault_path,
+                            prior_stock=carryover.prior_stock,
+                            new_rollback_path=new_rollback_path,
+                        )
+                    )
                     continue
             if (
                 current_active is not True
                 or current_snapshot != carryover.prior_stock
             ):
                 continue
-            set_raw_value(raw, active_path, False)
-            if carryover.prior_stock["present"]:
-                set_raw_value(raw, vault_path, carryover.prior_stock["value"])
-            else:
-                vault_section = raw_value(raw, vault_path[:-1], missing)
-                if isinstance(vault_section, dict):
-                    vault_section.pop(vault_path[-1], None)
-            state = raw_value(raw, rollback_path[:-1], missing)
+            writable_paths.update({active_path, rollback_path, vault_path})
+            actions.append(
+                _CarryoverAction(
+                    active_path=active_path,
+                    rollback_path=rollback_path,
+                    vault_path=vault_path,
+                    prior_stock=carryover.prior_stock,
+                )
+            )
+
+        if not actions:
+            return
+        _reject_managed_writes(writable_paths)
+
+        for action in actions:
+            set_raw_value(raw, action.active_path, False)
+            state = raw_value(raw, action.rollback_path[:-1], missing)
             if isinstance(state, dict):
-                state.pop(rollback_path[-1], None)
-            changed = True
-        if changed:
-            config_mod.save_config(raw, strip_defaults=False)
+                state.pop(action.rollback_path[-1], None)
+            if action.new_rollback_path is not None:
+                set_raw_value(
+                    raw,
+                    action.new_rollback_path,
+                    copy.deepcopy(action.prior_stock),
+                )
+                set_raw_value(raw, action.vault_path, False)
+            elif action.prior_stock["present"]:
+                set_raw_value(
+                    raw,
+                    action.vault_path,
+                    action.prior_stock["value"],
+                )
+            else:
+                vault_section = raw_value(raw, action.vault_path[:-1], missing)
+                if isinstance(vault_section, dict):
+                    vault_section.pop(action.vault_path[-1], None)
+
+        config_mod.save_config(raw, strip_defaults=False)

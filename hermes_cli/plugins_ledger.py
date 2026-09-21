@@ -254,11 +254,13 @@ class PluginLedgerMixin:
             )
         if not unload_all or for_force_rediscovery:
             from hermes_cli.plugins_login_backend import (
+                _validate_carryover_policy,
                 capture_carryovers,
                 restore_carryovers,
             )
             login_backend_carryovers = capture_carryovers(self, registrations)
             if unload_all:
+                _validate_carryover_policy(login_backend_carryovers)
                 self._login_backend_carryover.extend(login_backend_carryovers)
             else:
                 restore_carryovers(
