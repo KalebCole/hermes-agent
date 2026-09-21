@@ -12,9 +12,12 @@ from __future__ import annotations
 import subprocess
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence
 
 from agent.vault_store import VaultItemMeta
+
+if TYPE_CHECKING:
+    from agent.vault_backends.registry import LoginBackendProvider
 
 
 class UnlockRequired(Exception):
@@ -94,10 +97,54 @@ def _cfg() -> Dict:
     return cfg if isinstance(cfg, dict) else {}
 
 
-def external_backend_classes():
+def _stock_backend_providers() -> tuple["LoginBackendProvider", ...]:
     from agent.vault_backends.bitwarden import BitwardenLoginBackend
     from agent.vault_backends.onepassword import OnePasswordLoginBackend
-    return (OnePasswordLoginBackend, BitwardenLoginBackend)
+    from agent.vault_backends.registry import LoginBackendProvider
+
+    return (
+        LoginBackendProvider(
+            name=OnePasswordLoginBackend.name,
+            display_name=OnePasswordLoginBackend.display_name,
+            prefix=OnePasswordLoginBackend.prefix,
+            needs_unlock=OnePasswordLoginBackend.needs_unlock,
+            factory=OnePasswordLoginBackend,
+        ),
+        LoginBackendProvider(
+            name=BitwardenLoginBackend.name,
+            display_name=BitwardenLoginBackend.display_name,
+            prefix=BitwardenLoginBackend.prefix,
+            needs_unlock=BitwardenLoginBackend.needs_unlock,
+            factory=BitwardenLoginBackend,
+        ),
+    )
+
+
+def external_backend_providers() -> tuple["LoginBackendProvider", ...]:
+    """Stock providers with scoped plugin replacements/appendages overlaid."""
+    from agent.vault_backends.registry import list_providers
+
+    plugin_providers = list_providers()
+    replacements = {
+        provider.name: provider
+        for provider in plugin_providers
+        if provider.replaces_stock
+    }
+    providers = [
+        replacements.get(provider.name, provider)
+        for provider in _stock_backend_providers()
+    ]
+    providers.extend(
+        sorted(
+            (
+                provider
+                for provider in plugin_providers
+                if not provider.replaces_stock
+            ),
+            key=lambda provider: (provider.name, provider.prefix),
+        )
+    )
+    return tuple(providers)
 
 
 def is_installed(name: str) -> bool:
@@ -111,6 +158,15 @@ def is_installed(name: str) -> bool:
         from agent.secret_sources.onepassword import find_op
         return find_op() is not None
     return shutil.which("bw") is not None
+
+
+def provider_is_installed(provider: "LoginBackendProvider") -> bool:
+    """Registered plugin providers are present; stock providers require their CLI."""
+    from agent.vault_backends.registry import list_providers
+
+    if any(candidate is provider for candidate in list_providers()):
+        return True
+    return is_installed(provider.name)
 
 
 def is_enabled(name: str) -> bool:
@@ -128,10 +184,23 @@ def enabled_backends() -> List[LoginBackend]:
 
     cfg = _cfg()
     out: List[LoginBackend] = [LocalLoginBackend()]
-    for cls in external_backend_classes():
-        if is_enabled(cls.name):
-            section = cfg.get(cls.name) or {}
-            out.append(cls(section if isinstance(section, dict) else {}))
+    for provider in external_backend_providers():
+        section = cfg.get(provider.name) or {}
+        if isinstance(section, dict) and section.get("enabled") is False:
+            continue
+        if not provider_is_installed(provider):
+            continue
+        backend = provider.create(
+            section if isinstance(section, dict) else {}
+        )
+        if (
+            backend.display_name != provider.display_name
+            or backend.needs_unlock != provider.needs_unlock
+        ):
+            raise ValueError(
+                f"login backend factory {provider.name!r} returned inconsistent public metadata"
+            )
+        out.append(backend)
     return out
 
 

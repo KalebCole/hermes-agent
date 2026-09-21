@@ -140,16 +140,18 @@ def _cmd_list(args) -> None:
 
 def _cmd_sources(args) -> None:
     """Show the detected password managers; `--disable`/`--enable` flip the opt-out (`vault.<name>.enabled`)."""
-    from agent.vault_backends import enabled_backends
-    from agent.vault_backends.base import external_backend_classes, is_installed
+    from agent.vault_backends import enabled_backends, external_backend_providers
+    from agent.vault_backends.base import provider_is_installed
     from hermes_cli.config import _ensure_dict, load_config, save_config
 
     c = _console()
-    classes = {cls.name: cls for cls in external_backend_classes()}
+    providers = {
+        provider.name: provider for provider in external_backend_providers()
+    }
     if args.enable or args.disable:
         name = args.enable or args.disable
-        if name not in classes:
-            c.print(f"[red]Unknown password manager {name!r}[/] (expected one of {', '.join(classes)})")
+        if name not in providers:
+            c.print(f"[red]Unknown password manager {name!r}[/] (expected one of {', '.join(providers)})")
             return
         cfg = load_config()
         section = _ensure_dict(_ensure_dict(cfg, "vault"), name)
@@ -158,17 +160,19 @@ def _cmd_sources(args) -> None:
         else:
             section["enabled"] = False
         save_config(cfg)
-        c.print(f"[green]{classes[name].display_name} {'on' if args.enable else 'off'}[/] for browser logins.")
+        c.print(f"[green]{providers[name].display_name} {'on' if args.enable else 'off'}[/] for browser logins.")
         return
     enabled = {b.name for b in enabled_backends()}
-    for name, cls in classes.items():
+    for name, provider in providers.items():
         if name in enabled:
-            status = "[green]detected[/] · the agent asks you to unlock it when it needs a login"
-        elif is_installed(name):
+            status = "[green]detected[/]"
+            if provider.needs_unlock:
+                status += " · the agent asks you to unlock it when it needs a login"
+        elif provider_is_installed(provider):
             status = "[dim]turned off[/] (`hermes vault sources --enable {name}` to use it)".format(name=name)
         else:
             status = "[dim]not installed[/]"
-        c.print(f"  {cls.display_name:<10} {status}")
+        c.print(f"  {provider.display_name:<10} {status}")
     c.print("[dim]Managers are picked up automatically when their CLI is installed and signed in.[/]")
 
 

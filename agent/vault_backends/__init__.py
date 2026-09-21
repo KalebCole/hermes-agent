@@ -13,6 +13,18 @@ into a masked prompt owned by the surface (CLI panel, Desktop dialog) and is
 never a tool argument, never argv, never persisted.
 """
 
-from agent.vault_backends.base import LoginBackend, UnlockRequired, backend_for_handle, enabled_backends
+from agent.vault_backends.base import (
+    LoginBackend,
+    UnlockRequired,
+    backend_for_handle,
+    enabled_backends,
+    external_backend_providers,
+)
 
-__all__ = ["LoginBackend", "UnlockRequired", "backend_for_handle", "enabled_backends"]
+__all__ = [
+    "LoginBackend",
+    "UnlockRequired",
+    "backend_for_handle",
+    "enabled_backends",
+    "external_backend_providers",
+]
