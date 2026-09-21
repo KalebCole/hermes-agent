@@ -607,18 +607,24 @@ plugins:
   entries:
     broker-plugin:
       settings:
-        login_backend_enabled: true
+        login_backends:
+          bitwarden:
+            enabled: true
+            prior_stock:
+              present: true
+              value: true
 vault:
   bitwarden:
     enabled: false
 ```
 
-Use the dynamic rollback key
-`plugins.entries.<plugin_id>.settings.prior_stock_<backend_name>`. Assert the
-first activation snapshots the raw stock key as
-`{present: bool, value?: Any}`, enables the replacement, and disables the stock
-backend in one atomic write. Cover prior stock values `true`, `false`, and
-absent. Repeated activation must be a no-op that does not replace the snapshot.
+Use the per-backend state path
+`plugins.entries.<plugin_id>.settings.login_backends.<backend_name>`, with
+`enabled: bool` and `prior_stock: {present: bool, value?: Any}`. Assert the
+first activation snapshots the raw stock key, enables only that replacement,
+and disables the stock backend in one atomic write. Cover prior stock values
+`true`, `false`, and absent. Repeated activation must be a no-op that does not
+replace the snapshot.
 Deactivation must restore the exact raw value or exact absence and consume a
 valid snapshot in the same write; without a valid snapshot it must not touch the
 stock key. Repeated deactivation must be a no-op that never overwrites a later
@@ -645,10 +651,13 @@ never catches write exceptions. It may mutate the raw mapping and call
 `save_config(..., strip_defaults=False)` so exact stock-key absence can be
 restored. The provider record carries the owning plugin id so vault resolution
 can select the replacement only when the raw owner setting
-`settings.login_backend_enabled` is exactly `true`. Missing, false, malformed,
-or unreadable settings leave it inactive, and plugin manifest defaults are not
-consulted. When active, `vault.<stock>.enabled` applies to the stock backend and
-does not suppress the replacement.
+`settings.login_backends.<backend_name>.enabled` is exactly `true`. Missing,
+false, malformed, or unreadable settings leave it inactive, and plugin manifest
+defaults are not consulted. When active, `vault.<stock>.enabled` applies to the
+stock backend and does not suppress the replacement. Targeted unload restores
+owned active replacements; force reload carries them through discovery and
+restores only omitted, disabled, or failed registrations. Routine unload-all
+does not mutate config.
 
 - [ ] **Step 6: Run the focused tests and verify GREEN**
 

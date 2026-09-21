@@ -34,6 +34,7 @@ class PluginRegistration:
     key: str
     release: Callable[[], None]
     plugin_key: str = ""
+    metadata: Any = None
     # Process-global host infrastructure (e.g. dashboard-auth providers): kept out of ``_registration_order``
     # so unload-all cannot dispose it, but still disposed by a *targeted* unload and evicted on force
     # re-discovery when the plugin no longer re-registers it.
@@ -62,7 +63,7 @@ class PluginRegistration:
 class PluginLedgerMixin:
     def _track_registration(
         self, manifest: PluginManifest, kind: str, key: str, release: Callable[[], None], *,
-        persistent: bool = False,
+        persistent: bool = False, metadata: Any = None,
     ) -> PluginRegistration:
         """Record one registration under its canonical plugin key. ``persistent`` ones (process-global host
         infrastructure) stay in the ownership ledger for attribution but NOT in ``_registration_order``, so a
@@ -71,7 +72,8 @@ class PluginLedgerMixin:
         See #91701.
         """
         registration = PluginRegistration(
-            kind=kind, key=key, release=release, plugin_key=manifest_key(manifest), persistent=persistent)
+            kind=kind, key=key, release=release, plugin_key=manifest_key(manifest),
+            persistent=persistent, metadata=metadata)
         registration._on_dispose = lambda disposed: self._forget_registrations([disposed])
         self._ownership_ledger.setdefault(registration.plugin_key, []).append(registration)
         if not persistent:
@@ -81,6 +83,7 @@ class PluginLedgerMixin:
     def _track_scoped_registration(
         self, manifest: PluginManifest, kind: str, name: str, registry: Any, current: Any,
         previous: Any, *, finalize: Optional[Callable[[], None]] = None,
+        metadata: Any = None,
     ) -> PluginRegistration:
         """Lease one ``(kind, scope, name)`` slot of a scope-keyed process-global registry. Unload calls
         ``registry.restore_registration(name, current, replacement, scope=...)`` — identity-conditional, so a
@@ -91,7 +94,9 @@ class PluginLedgerMixin:
             restore=lambda replacement: registry.restore_registration(name, current, replacement, scope=scope),
             finalize=finalize,
         )
-        return self._track_registration(manifest, kind, name, lease.dispose)
+        return self._track_registration(
+            manifest, kind, name, lease.dispose, metadata=metadata
+        )
 
     def _active_persistent(self) -> List[PluginRegistration]:
         """Live persistent registrations across every plugin in the ownership ledger."""
@@ -224,7 +229,12 @@ class PluginLedgerMixin:
         with self._discovery_lock, _plugin_home_scope(self.home_path):
             return self._unload_scoped(plugin)
 
-    def _unload_scoped(self, plugin: Union[str, PluginManifest, LoadedPlugin, None] = None) -> bool:
+    def _unload_scoped(
+        self,
+        plugin: Union[str, PluginManifest, LoadedPlugin, None] = None,
+        *,
+        for_force_rediscovery: bool = False,
+    ) -> bool:
         """Unload one plugin (or all when ``plugin=None``, as force rediscovery does). Every ledger registration
         — including on_unload callbacks and supervised tasks — is disposed in reverse acquisition order with
         identity-conditional inverses. Returns ``True`` when anything was found."""
@@ -241,6 +251,17 @@ class PluginLedgerMixin:
             # See #91701.
             registrations.extend(
                 r for key in target_keys for r in self._ownership_ledger.get(key, []) if r.persistent and r.active
+            )
+        from hermes_cli.plugins_login_backend import (
+            capture_carryovers,
+            restore_carryovers,
+        )
+        login_backend_carryovers = capture_carryovers(self, registrations)
+        if unload_all and for_force_rediscovery:
+            self._login_backend_carryover.extend(login_backend_carryovers)
+        elif not unload_all:
+            restore_carryovers(
+                login_backend_carryovers, preserve_reregistered=False
             )
         found = bool(target_keys or registrations)
         self._dispose_registrations(registrations)

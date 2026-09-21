@@ -11,7 +11,11 @@ from unittest.mock import patch
 import pytest
 import yaml
 
-from agent.vault_backends import backend_for_handle, enabled_backends
+from agent.vault_backends import (
+    available_backend_providers,
+    backend_for_handle,
+    enabled_backends,
+)
 from agent.vault_backends import registry as login_backend_registry
 from hermes_cli.plugins import PluginManager
 
@@ -270,6 +274,61 @@ def register(ctx):
         prefix={prefix!r},
         needs_unlock={needs_unlock!r},
         replace_stock={replace_stock!r},
+    )
+
+def set_active(name, active):
+    plugin_context.set_login_backend_active(name, active)
+"""
+    (plugin_dir / "__init__.py").write_text(source, encoding="utf-8")
+
+
+def _write_dual_replacement_plugin(home: Path, plugin_id: str = "dual-broker") -> None:
+    plugin_dir = home / "plugins" / plugin_id
+    plugin_dir.mkdir(parents=True)
+    (plugin_dir / "plugin.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "name": plugin_id,
+                "version": "0.1.0",
+                "description": "Dual stock login backend replacement",
+            }
+        ),
+        encoding="utf-8",
+    )
+    source = _BACKEND_CLASS.format(
+        class_name="BrokerOnePasswordBackend",
+        name="onepassword",
+        display_name="Broker 1Password",
+        prefix="op:",
+        needs_unlock=True,
+    )
+    source += _BACKEND_CLASS.format(
+        class_name="BrokerBitwardenBackend",
+        name="bitwarden",
+        display_name="Broker Bitwarden",
+        prefix="bw:",
+        needs_unlock=True,
+    )
+    source += """
+
+def register(ctx):
+    global plugin_context
+    plugin_context = ctx
+    ctx.register_login_backend(
+        BrokerOnePasswordBackend,
+        name="onepassword",
+        display_name="Broker 1Password",
+        prefix="op:",
+        needs_unlock=True,
+        replace_stock=True,
+    )
+    ctx.register_login_backend(
+        BrokerBitwardenBackend,
+        name="bitwarden",
+        display_name="Broker Bitwarden",
+        prefix="bw:",
+        needs_unlock=True,
+        replace_stock=True,
     )
 
 def set_active(name, active):
@@ -681,8 +740,12 @@ def test_replacement_activation_restores_prior_stock_value(prior_stock: bool):
     module.set_active("bitwarden", True)
     active = yaml.safe_load(path.read_text(encoding="utf-8"))
     assert active["plugins"]["entries"]["broker-plugin"]["settings"] == {
-        "login_backend_enabled": True,
-        "prior_stock_bitwarden": {"present": True, "value": prior_stock},
+        "login_backends": {
+            "bitwarden": {
+                "enabled": True,
+                "prior_stock": {"present": True, "value": prior_stock},
+            }
+        },
         "unrelated": "keep",
     }
     assert active["vault"]["bitwarden"] == {
@@ -693,14 +756,12 @@ def test_replacement_activation_restores_prior_stock_value(prior_stock: bool):
 
     module.set_active("bitwarden", False)
     inactive = yaml.safe_load(path.read_text(encoding="utf-8"))
-    assert inactive["plugins"]["entries"]["broker-plugin"]["settings"][
-        "login_backend_enabled"
-    ] is False
+    state = inactive["plugins"]["entries"]["broker-plugin"]["settings"][
+        "login_backends"
+    ]["bitwarden"]
+    assert state["enabled"] is False
     assert inactive["vault"]["bitwarden"]["enabled"] is prior_stock
-    assert (
-        "prior_stock_bitwarden"
-        not in inactive["plugins"]["entries"]["broker-plugin"]["settings"]
-    )
+    assert "prior_stock" not in state
     assert inactive["display"] == {"skin": "slate"}
 
 
@@ -728,14 +789,19 @@ def test_replacement_activation_restores_prior_stock_absence():
 
     module.set_active("bitwarden", True)
     active = yaml.safe_load(path.read_text(encoding="utf-8"))
-    settings = active["plugins"]["entries"]["broker-plugin"]["settings"]
-    assert settings["prior_stock_bitwarden"] == {"present": False}
+    state = active["plugins"]["entries"]["broker-plugin"]["settings"][
+        "login_backends"
+    ]["bitwarden"]
+    assert state["prior_stock"] == {"present": False}
     assert active["vault"]["bitwarden"]["enabled"] is False
 
     module.set_active("bitwarden", False)
     inactive = yaml.safe_load(path.read_text(encoding="utf-8"))
     assert "enabled" not in inactive["vault"]["bitwarden"]
-    assert "prior_stock_bitwarden" not in inactive["plugins"]["entries"]["broker-plugin"]["settings"]
+    state = inactive["plugins"]["entries"]["broker-plugin"]["settings"][
+        "login_backends"
+    ]["bitwarden"]
+    assert "prior_stock" not in state
     assert inactive["vault"]["bitwarden"]["endpoint"] == "https://vault.invalid"
 
 
@@ -772,8 +838,8 @@ def test_repeated_replacement_activation_does_not_replace_snapshot_or_write():
     assert path.read_bytes() == before
     unchanged = yaml.safe_load(path.read_text(encoding="utf-8"))
     assert unchanged["plugins"]["entries"]["broker-plugin"]["settings"][
-        "prior_stock_bitwarden"
-    ] == {"present": True, "value": True}
+        "login_backends"
+    ]["bitwarden"]["prior_stock"] == {"present": True, "value": True}
 
 
 def test_repeated_replacement_deactivation_does_not_overwrite_later_user_change():
@@ -830,7 +896,7 @@ def test_replacement_deactivation_without_snapshot_does_not_touch_stock_key():
     path = home / "config.yaml"
     raw = yaml.safe_load(path.read_text(encoding="utf-8"))
     raw["plugins"]["entries"]["broker-plugin"]["settings"] = {
-        "login_backend_enabled": True
+        "login_backends": {"bitwarden": {"enabled": True}}
     }
     path.write_text(yaml.safe_dump(raw), encoding="utf-8")
     manager = PluginManager()
@@ -842,8 +908,8 @@ def test_replacement_deactivation_without_snapshot_does_not_touch_stock_key():
     inactive = yaml.safe_load(path.read_text(encoding="utf-8"))
     assert inactive["vault"]["bitwarden"]["enabled"] == "user-value"
     assert inactive["plugins"]["entries"]["broker-plugin"]["settings"][
-        "login_backend_enabled"
-    ] is False
+        "login_backends"
+    ]["bitwarden"]["enabled"] is False
 
 
 def test_replacement_selection_requires_explicit_owner_activation():
@@ -879,11 +945,208 @@ def test_replacement_selection_requires_explicit_owner_activation():
         assert active.display_name == "Broker Bitwarden"
 
 
+def test_dual_replacement_activation_is_per_backend():
+    home = Path(os.environ["HERMES_HOME"])
+    _write_dual_replacement_plugin(home)
+    _configure_plugins(
+        home,
+        ["dual-broker"],
+        grants={"dual-broker": ["vault.login_backend_replace"]},
+        vault={
+            "onepassword": {"enabled": "onepassword-user-value"},
+            "bitwarden": {"enabled": True},
+        },
+    )
+    manager = PluginManager()
+    manager.discover_and_load()
+    module = manager._plugins["dual-broker"].module
+
+    module.set_active("bitwarden", True)
+
+    providers = {
+        provider.name: provider for provider in available_backend_providers()
+    }
+    assert providers["onepassword"].display_name == "1Password"
+    assert providers["bitwarden"].display_name == "Broker Bitwarden"
+    raw = yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8"))
+    assert raw["plugins"]["entries"]["dual-broker"]["settings"] == {
+        "login_backends": {
+            "bitwarden": {
+                "enabled": True,
+                "prior_stock": {"present": True, "value": True},
+            }
+        }
+    }
+    assert raw["vault"]["onepassword"]["enabled"] == "onepassword-user-value"
+
+    module.set_active("bitwarden", False)
+
+    restored = yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8"))
+    assert restored["plugins"]["entries"]["dual-broker"]["settings"] == {
+        "login_backends": {"bitwarden": {"enabled": False}}
+    }
+    assert restored["vault"]["onepassword"]["enabled"] == "onepassword-user-value"
+    assert restored["vault"]["bitwarden"]["enabled"] is True
+
+
+def _active_dual_replacement_manager(home: Path) -> tuple[PluginManager, object, Path]:
+    _write_dual_replacement_plugin(home)
+    _configure_plugins(
+        home,
+        ["dual-broker"],
+        grants={"dual-broker": ["vault.login_backend_replace"]},
+        vault={
+            "onepassword": {"enabled": "onepassword-user-value"},
+            "bitwarden": {"enabled": "bitwarden-user-value"},
+        },
+    )
+    manager = PluginManager()
+    manager.discover_and_load()
+    module = manager._plugins["dual-broker"].module
+    module.set_active("bitwarden", True)
+    return manager, module, home / "config.yaml"
+
+
+def _assert_bitwarden_replacement_cleaned(config_path: Path) -> None:
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    state = raw["plugins"]["entries"]["dual-broker"]["settings"][
+        "login_backends"
+    ]["bitwarden"]
+    assert state == {"enabled": False}
+    assert raw["vault"]["bitwarden"]["enabled"] == "bitwarden-user-value"
+    assert raw["vault"]["onepassword"]["enabled"] == "onepassword-user-value"
+
+
+def test_targeted_unload_restores_active_replacement_and_consumes_snapshot():
+    manager, _, config_path = _active_dual_replacement_manager(
+        Path(os.environ["HERMES_HOME"])
+    )
+
+    assert manager.unload("dual-broker") is True
+
+    _assert_bitwarden_replacement_cleaned(config_path)
+    assert login_backend_registry.snapshot_registration(
+        "bitwarden", scope=manager.scope_key
+    ) is None
+
+
+def test_routine_unload_all_does_not_mutate_active_replacement_config():
+    manager, _, config_path = _active_dual_replacement_manager(
+        Path(os.environ["HERMES_HOME"])
+    )
+    before = config_path.read_bytes()
+
+    assert manager.unload() is True
+
+    assert config_path.read_bytes() == before
+
+
+def test_force_reload_omitting_active_replacement_restores_stock():
+    home = Path(os.environ["HERMES_HOME"])
+    manager, _, config_path = _active_dual_replacement_manager(home)
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    raw["plugins"]["enabled"] = []
+    config_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+
+    manager.discover_and_load(force=True)
+
+    _assert_bitwarden_replacement_cleaned(config_path)
+
+
+def test_failed_force_reload_restores_stock_and_consumes_snapshot():
+    home = Path(os.environ["HERMES_HOME"])
+    manager, _, config_path = _active_dual_replacement_manager(home)
+    (home / "plugins" / "dual-broker" / "__init__.py").write_text(
+        "raise RuntimeError('reload failed')\n",
+        encoding="utf-8",
+    )
+
+    manager.discover_and_load(force=True)
+
+    _assert_bitwarden_replacement_cleaned(config_path)
+    assert manager._plugins["dual-broker"].enabled is False
+
+
+def test_force_reload_discovery_exception_restores_stock_and_consumes_snapshot(
+    monkeypatch,
+):
+    manager, _, config_path = _active_dual_replacement_manager(
+        Path(os.environ["HERMES_HOME"])
+    )
+
+    def raise_during_discovery():
+        raise RuntimeError("discovery failed")
+
+    monkeypatch.setattr(manager, "_discover_and_load_inner", raise_during_discovery)
+
+    with pytest.raises(RuntimeError, match="discovery failed"):
+        manager.discover_and_load(force=True)
+
+    _assert_bitwarden_replacement_cleaned(config_path)
+
+
+def test_successful_force_reload_preserves_active_replacement_snapshot():
+    home = Path(os.environ["HERMES_HOME"])
+    manager, _, config_path = _active_dual_replacement_manager(home)
+    before = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+    manager.discover_and_load(force=True)
+
+    assert yaml.safe_load(config_path.read_text(encoding="utf-8")) == before
+    providers = {
+        provider.name: provider for provider in available_backend_providers()
+    }
+    assert providers["bitwarden"].display_name == "Broker Bitwarden"
+
+
+def test_repeated_cleanup_does_not_overwrite_later_user_change():
+    manager, _, config_path = _active_dual_replacement_manager(
+        Path(os.environ["HERMES_HOME"])
+    )
+    manager.unload("dual-broker")
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    raw["vault"]["bitwarden"]["enabled"] = "later-user-value"
+    config_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    before = config_path.read_bytes()
+
+    assert manager.unload("dual-broker") is False
+
+    assert config_path.read_bytes() == before
+
+
+def test_targeted_unload_isolated_between_profiles():
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    root = Path(os.environ["HERMES_HOME"]).parent
+    home_a = root / "replacement-profile-a"
+    home_b = root / "replacement-profile-b"
+
+    token_a = set_hermes_home_override(home_a)
+    try:
+        manager_a, _, config_a = _active_dual_replacement_manager(home_a)
+    finally:
+        reset_hermes_home_override(token_a)
+    token_b = set_hermes_home_override(home_b)
+    try:
+        manager_b, _, config_b = _active_dual_replacement_manager(home_b)
+        before_b = config_b.read_bytes()
+    finally:
+        reset_hermes_home_override(token_b)
+
+    manager_a.unload("dual-broker")
+
+    _assert_bitwarden_replacement_cleaned(config_a)
+    assert config_b.read_bytes() == before_b
+    assert login_backend_registry.snapshot_registration(
+        "bitwarden", scope=manager_b.scope_key
+    ) is not None
+
+
 @pytest.mark.parametrize(
     "managed_path",
     [
-        "plugins.entries.broker-plugin.settings.login_backend_enabled",
-        "plugins.entries.broker-plugin.settings.prior_stock_bitwarden",
+        "plugins.entries.broker-plugin.settings.login_backends.bitwarden.enabled",
+        "plugins.entries.broker-plugin.settings.login_backends.bitwarden.prior_stock",
         "vault.bitwarden.enabled",
     ],
 )
@@ -1013,6 +1276,27 @@ def _replacement_activation_subject() -> tuple[object, Path]:
         (("plugins", "entries"), "entries"),
         (("plugins", "entries", "broker-plugin"), 1),
         (("plugins", "entries", "broker-plugin", "settings"), []),
+        (
+            (
+                "plugins",
+                "entries",
+                "broker-plugin",
+                "settings",
+                "login_backends",
+            ),
+            [],
+        ),
+        (
+            (
+                "plugins",
+                "entries",
+                "broker-plugin",
+                "settings",
+                "login_backends",
+                "bitwarden",
+            ),
+            [],
+        ),
         (("vault",), "vault"),
         (("vault", "bitwarden"), []),
     ],
@@ -1029,7 +1313,7 @@ def test_replacement_activation_rejects_malformed_relevant_parent_without_writin
     if path:
         node = raw
         for key in path[:-1]:
-            node = node[key]
+            node = node.setdefault(key, {})
         node[path[-1]] = malformed
     else:
         raw = malformed
@@ -1056,12 +1340,13 @@ def test_replacement_activation_rejects_malformed_active_value_without_writing(
     module, config_path = _replacement_activation_subject()
     raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     settings = raw["plugins"]["entries"]["broker-plugin"].setdefault("settings", {})
-    settings["login_backend_enabled"] = malformed
+    state = settings.setdefault("login_backends", {}).setdefault("bitwarden", {})
+    state["enabled"] = malformed
     config_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
     before = config_path.read_bytes()
 
     with patch.object(config_mod, "save_config") as save_config, pytest.raises(
-        TypeError, match="login_backend_enabled.*bool"
+        TypeError, match="login_backends.bitwarden.enabled.*bool"
     ):
         module.set_active("bitwarden", active)
 
@@ -1091,13 +1376,14 @@ def test_replacement_activation_rejects_malformed_snapshot_without_writing(
     module, config_path = _replacement_activation_subject()
     raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     settings = raw["plugins"]["entries"]["broker-plugin"].setdefault("settings", {})
-    settings["login_backend_enabled"] = not active
-    settings["prior_stock_bitwarden"] = malformed
+    state = settings.setdefault("login_backends", {}).setdefault("bitwarden", {})
+    state["enabled"] = not active
+    state["prior_stock"] = malformed
     config_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
     before = config_path.read_bytes()
 
     with patch.object(config_mod, "save_config") as save_config, pytest.raises(
-        (TypeError, ValueError), match="prior_stock_bitwarden"
+        (TypeError, ValueError), match="login_backends.bitwarden.prior_stock"
     ):
         module.set_active("bitwarden", active)
 
@@ -1116,8 +1402,8 @@ def test_replacement_activation_ignores_unrelated_malformed_section():
     saved = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     assert saved["display"] == []
     assert saved["plugins"]["entries"]["broker-plugin"]["settings"][
-        "login_backend_enabled"
-    ] is True
+        "login_backends"
+    ]["bitwarden"]["enabled"] is True
 
 
 def test_replacement_activation_save_failure_leaves_config_unchanged():

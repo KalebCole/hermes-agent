@@ -1092,21 +1092,46 @@ def set_login_backend_active(self, name: str, active: bool) -> None:
 
 The call is valid only for the calling plugin's currently registered
 `replace_stock=True` provider. On the first activation, Hermes snapshots the
-raw stock setting under
-`plugins.entries.<plugin_id>.settings.prior_stock_<name>` as
-`{present: bool, value?: Any}`, writes `login_backend_enabled: true`, and writes
-`vault.<name>.enabled: false`. Repeated activation is a no-op and does not
-replace that snapshot.
+raw stock setting and activation state per backend:
 
-Deactivation writes `login_backend_enabled: false`, restores the exact prior
-stock value or its exact absence when a valid snapshot exists, and consumes the
-snapshot. Without a valid snapshot it leaves the stock key untouched. Repeated
+```yaml
+plugins:
+  entries:
+    <plugin_id>:
+      settings:
+        login_backends:
+          <backend_name>:
+            enabled: true
+            prior_stock:
+              present: true
+              value: <exact prior value>
+```
+
+`prior_stock` is `{present: bool, value?: Any}`. Activation also writes
+`vault.<name>.enabled: false`. Repeated activation is a no-op and does not
+replace the snapshot.
+
+Deactivation writes that backend entry's `enabled: false`, restores the exact
+prior stock value or its exact absence when a valid snapshot exists, and
+consumes `prior_stock`. It does not read or write another backend's entry.
+Without a valid snapshot it leaves the stock key untouched. Repeated
 deactivation is a no-op, so later user changes are never overwritten. The
-provider registry records the owner, and selection uses the replacement only
-when the raw owner setting `login_backend_enabled` is exactly `true`. Missing,
-false, malformed, or unreadable settings leave the replacement inactive; plugin
-manifest defaults are not consulted. While the replacement is active, the stock
-vault's disabled flag does not suppress it.
+provider registry records the owner, and selection uses a replacement only
+when its raw
+`plugins.entries.<plugin_id>.settings.login_backends.<backend_name>.enabled`
+setting is exactly `true`. Missing, false, malformed, or unreadable settings
+leave that replacement inactive; plugin manifest defaults are not consulted.
+While the replacement is active, the stock vault's disabled flag does not
+suppress it.
+
+Targeted plugin unload, disable, or uninstall restores every currently owned
+active replacement and consumes its rollback snapshot before unregistering the
+provider. Force rediscovery carries active records across the unload phase:
+successful re-registration preserves them, while an omitted, disabled, or
+failed replacement is restored after discovery, including when discovery
+raises. Routine process shutdown/unload-all does not mutate configuration.
+Cleanup is profile-scoped and generation-checked, so stale registrations cannot
+restore a later generation or another profile.
 
 The active, rollback, and stock dotted paths must all be writable under
 managed-scope policy, and managed installs reject the operation. Hermes holds

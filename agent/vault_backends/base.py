@@ -165,9 +165,17 @@ def _replacement_is_active(provider: "LoginBackendProvider") -> bool:
     entries = plugins.get("entries") if isinstance(plugins, dict) else None
     entry = entries.get(provider.owner_plugin_id) if isinstance(entries, dict) else None
     settings = entry.get("settings") if isinstance(entry, dict) else None
+    login_backends = (
+        settings.get("login_backends") if isinstance(settings, dict) else None
+    )
+    backend_state = (
+        login_backends.get(provider.name)
+        if isinstance(login_backends, dict)
+        else None
+    )
     return (
-        isinstance(settings, dict)
-        and settings.get("login_backend_enabled") is True
+        isinstance(backend_state, dict)
+        and backend_state.get("enabled") is True
     )
 
 

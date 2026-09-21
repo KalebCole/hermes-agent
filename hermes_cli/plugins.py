@@ -49,6 +49,11 @@ from hermes_cli.plugins_loader import (
     PluginLoaderMixin, _BARE_MODULE_SCOPE, _MODULE_NAMESPACE_LOCK, _NS_PARENT, _evict_modules,
     _plugin_home_scope, _serialized_replacement,
 )
+from hermes_cli.plugins_login_backend import (
+    LoginBackendCarryover,
+    restore_carryovers,
+    set_active as set_login_backend_active,
+)
 from hermes_cli.plugins_dispatch import (  # noqa: F401 — re-exported
     DEFAULT_SYSTEM_PROMPT_SECTION_MAX_CHARS, HERMES_EVENT_NAMESPACE, MAX_SYSTEM_PROMPT_SECTION_CHARS,
     MAX_SYSTEM_PROMPT_SECTIONS_TOTAL_CHARS, PLUGIN_SECTIONS_END, PLUGIN_SECTIONS_START,
@@ -590,6 +595,7 @@ class PluginContext:
             login_backend_registry,
             provider,
             previous,
+            metadata=provider,
         )
         logger.info(
             "Plugin %s registered login backend name=%s prefix=%s replacement=%s",
@@ -603,8 +609,6 @@ class PluginContext:
     def set_login_backend_active(self, name: str, active: bool) -> None:
         """Atomically toggle this plugin's registered stock-backend replacement."""
         from agent.vault_backends import registry as login_backend_registry
-        from hermes_cli import config as config_mod
-        from hermes_cli import managed_scope
 
         provider = login_backend_registry.snapshot_registration(
             name, scope=self._manager.scope_key
@@ -621,137 +625,7 @@ class PluginContext:
         if not isinstance(active, bool):
             raise TypeError("active must be a bool")
 
-        plugin_path = (
-            "plugins",
-            "entries",
-            self.plugin_id,
-            "settings",
-            "login_backend_enabled",
-        )
-        rollback_path = plugin_path[:-1] + (f"prior_stock_{provider.name}",)
-        vault_path = ("vault", provider.name, "enabled")
-        config_path = config_mod.get_config_path()
-        with _locked_plugin_state(config_path), config_mod._CONFIG_LOCK:
-            if config_mod.is_managed():
-                raise PermissionError(
-                    "Login backend activation cannot be changed in a managed install"
-                )
-            for path in (plugin_path, rollback_path, vault_path):
-                dotted_path = ".".join(path)
-                if managed_scope.is_key_managed(dotted_path):
-                    raise PermissionError(
-                        f"Login backend setting {dotted_path!r} is administrator-managed"
-                    )
-            try:
-                raw = config_mod.require_readable_config_before_write(config_path)
-            except RuntimeError as exc:
-                if isinstance(exc.__cause__, TypeError):
-                    raise TypeError(
-                        "Login backend activation config root must be a mapping"
-                    ) from exc
-                raise
-            missing = object()
-
-            def get_raw(path: tuple[str, ...]) -> Any:
-                node: Any = raw
-                for key in path:
-                    if not isinstance(node, Mapping) or key not in node:
-                        return missing
-                    node = node[key]
-                return node
-
-            def validate_parent_path(path: tuple[str, ...]) -> None:
-                node: Any = raw
-                traversed: list[str] = []
-                for key in path:
-                    if not isinstance(node, Mapping):
-                        dotted_path = ".".join(traversed) or "<config root>"
-                        raise TypeError(
-                            f"Login backend activation path {dotted_path!r} "
-                            "must be a mapping"
-                        )
-                    if key not in node:
-                        return
-                    node = node[key]
-                    traversed.append(key)
-                if not isinstance(node, Mapping):
-                    dotted_path = ".".join(traversed)
-                    raise TypeError(
-                        f"Login backend activation path {dotted_path!r} "
-                        "must be a mapping"
-                    )
-
-            def set_raw(path: tuple[str, ...], value: Any) -> None:
-                node = raw
-                for key in path[:-1]:
-                    child = node.get(key)
-                    if child is None:
-                        child = {}
-                        node[key] = child
-                    node = child
-                node[path[-1]] = value
-
-            for path in (plugin_path[:-1], rollback_path[:-1], vault_path[:-1]):
-                validate_parent_path(path)
-
-            current = get_raw(plugin_path)
-            if current is not missing and type(current) is not bool:
-                raise TypeError(
-                    f"Login backend setting {'.'.join(plugin_path)!r} must be a bool"
-                )
-
-            snapshot = get_raw(rollback_path)
-            if snapshot is not missing:
-                rollback_name = ".".join(rollback_path)
-                if not isinstance(snapshot, Mapping):
-                    raise TypeError(
-                        f"Login backend snapshot {rollback_name!r} must be a mapping"
-                    )
-                present = snapshot.get("present", missing)
-                if type(present) is not bool:
-                    raise TypeError(
-                        f"Login backend snapshot {rollback_name!r} must contain "
-                        "a bool 'present'"
-                    )
-                expected_keys = {"present", "value"} if present else {"present"}
-                if set(snapshot) != expected_keys:
-                    value_rule = (
-                        "contain exactly 'present' and 'value'"
-                        if present
-                        else "contain only 'present'"
-                    )
-                    raise ValueError(
-                        f"Login backend snapshot {rollback_name!r} must {value_rule}"
-                    )
-
-            if current is active:
-                return
-
-            if active:
-                stock_value = get_raw(vault_path)
-                snapshot = {"present": stock_value is not missing}
-                if stock_value is not missing:
-                    snapshot["value"] = stock_value
-                set_raw(rollback_path, snapshot)
-                set_raw(plugin_path, True)
-                set_raw(vault_path, False)
-            else:
-                set_raw(plugin_path, False)
-                if snapshot is not missing:
-                    if snapshot["present"]:
-                        set_raw(vault_path, snapshot["value"])
-                    else:
-                        vault_section = get_raw(vault_path[:-1])
-                        if isinstance(vault_section, Mapping):
-                            vault_section.pop(vault_path[-1], None)
-                    settings = get_raw(rollback_path[:-1])
-                    if isinstance(settings, Mapping):
-                        settings.pop(rollback_path[-1], None)
-
-            config_mod.save_config(
-                raw,
-                strip_defaults=False,
-            )
+        set_login_backend_active(self.plugin_id, provider.name, active)
 
     def call_mcp(
         self, server: str, tool: str, arguments: Optional[Dict[str, Any]] = None,
@@ -1443,6 +1317,7 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
         # disposed so a disabled/removed auth plugin's provider does not outlive its plugin (#91701
         # follow-up).
         self._persistent_carryover: List[PluginRegistration] = []
+        self._login_backend_carryover: List[LoginBackendCarryover] = []
         # Deferred platforms whose client tools registered at discovery (see
         # _register_deferred_platform_tools): imported package (don't re-execute on materialize)
         # and contributed tool names (so `hermes plugins list` still attributes them).
@@ -1475,9 +1350,14 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
             if self._discovered and not force:
                 return
             if force:
-                self.unload()  # the ledger owns teardown of process-global registries
+                self._unload_scoped(None, for_force_rediscovery=True)
             if env_var_enabled("HERMES_SAFE_MODE"):
                 logger.info("HERMES_SAFE_MODE=1 — plugin discovery skipped")
+                carryovers, self._login_backend_carryover = (
+                    self._login_backend_carryover,
+                    [],
+                )
+                restore_carryovers(carryovers, preserve_reregistered=True)
                 self._discovered = True
                 return
             # Flag set up front as a re-entrancy guard (register() can trigger discovery again) but
@@ -1486,6 +1366,11 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
             self._discovered = True
             try:
                 self._discover_and_load_inner()
+                carryovers, self._login_backend_carryover = (
+                    self._login_backend_carryover,
+                    [],
+                )
+                restore_carryovers(carryovers, preserve_reregistered=True)
                 # Persistent registrations survived the unload-all; now that plugins re-registered,
                 # dispose the ones whose plugin did not come back.
                 # Now that plugins have had their chance to re-register, dispose the ones whose plugin did
@@ -1503,6 +1388,11 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
                     # #64188; outbound webhooks added per #92682 review).
                     self._re_register_config_hooks_after_force()
             except BaseException:
+                carryovers, self._login_backend_carryover = (
+                    self._login_backend_carryover,
+                    [],
+                )
+                restore_carryovers(carryovers, preserve_reregistered=True)
                 self._discovered = False
                 raise
 
