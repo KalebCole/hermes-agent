@@ -38,6 +38,10 @@ _prefixes_by_scope: dict[str, dict[str, LoginBackendProvider]] = {}
 _lock = threading.Lock()
 
 
+def prefixes_overlap(first: str, second: str) -> bool:
+    return first.startswith(second) or second.startswith(first)
+
+
 def _validate_provider(provider: LoginBackendProvider) -> None:
     if not isinstance(provider, LoginBackendProvider):
         raise TypeError(
@@ -67,6 +71,19 @@ def register_provider(provider: LoginBackendProvider, *, scope: str) -> None:
             raise ValueError(f"backend name {provider.name!r} is already registered")
         if provider.prefix in prefixes:
             raise ValueError(f"handle prefix {provider.prefix!r} is already registered")
+        overlapping_prefix = next(
+            (
+                registered_prefix
+                for registered_prefix in prefixes
+                if prefixes_overlap(provider.prefix, registered_prefix)
+            ),
+            None,
+        )
+        if overlapping_prefix is not None:
+            raise ValueError(
+                f"handle prefix {provider.prefix!r} overlaps registered prefix "
+                f"{overlapping_prefix!r}"
+            )
         if scope not in _providers_by_scope:
             providers = _providers_by_scope.setdefault(scope, {})
             prefixes = _prefixes_by_scope.setdefault(scope, {})

@@ -342,6 +342,65 @@ def test_real_discovery_rejects_duplicate_handle_prefix():
     assert "handle prefix 'broker:' is already registered" in prefix_plugin.error
 
 
+@pytest.mark.parametrize("prefix", ["vault_plugin:", "op:team:", "bw:team:"])
+def test_real_discovery_rejects_stock_handle_prefix_extensions(prefix: str):
+    home = Path(os.environ["HERMES_HOME"])
+    _write_plugin(
+        home,
+        "overlap-plugin",
+        backend_name="overlap",
+        display_name="Overlapping vault",
+        prefix=prefix,
+    )
+    _configure_plugins(home, ["overlap-plugin"])
+
+    manager = PluginManager()
+    manager.discover_and_load()
+
+    plugin = manager._plugins["overlap-plugin"]
+    assert plugin.enabled is False
+    assert f"handle prefix {prefix!r} overlaps reserved stock prefix" in plugin.error
+
+
+@pytest.mark.parametrize(
+    ("first_prefix", "second_prefix"),
+    [
+        ("broker:", "broker:special:"),
+        ("broker:special:", "broker:"),
+    ],
+)
+def test_real_discovery_rejects_overlapping_plugin_handle_prefixes(
+    first_prefix: str,
+    second_prefix: str,
+):
+    home = Path(os.environ["HERMES_HOME"])
+    _write_plugin(
+        home,
+        "a-first-plugin",
+        backend_name="first",
+        display_name="First vault",
+        prefix=first_prefix,
+    )
+    _write_plugin(
+        home,
+        "b-second-plugin",
+        backend_name="second",
+        display_name="Second vault",
+        prefix=second_prefix,
+    )
+    _configure_plugins(home, ["a-first-plugin", "b-second-plugin"])
+
+    manager = PluginManager()
+    manager.discover_and_load()
+
+    second_plugin = manager._plugins["b-second-plugin"]
+    assert second_plugin.enabled is False
+    assert (
+        f"handle prefix {second_prefix!r} overlaps registered prefix "
+        f"{first_prefix!r}"
+    ) in second_plugin.error
+
+
 def test_stock_replacement_requires_capability_grant():
     home = Path(os.environ["HERMES_HOME"])
     _write_plugin(

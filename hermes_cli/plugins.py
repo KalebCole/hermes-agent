@@ -525,7 +525,7 @@ class PluginContext:
     ) -> PluginRegistration:
         """Register a profile-scoped browser credential-vault login backend."""
         from agent.vault_backends import registry as login_backend_registry
-        from agent.vault_backends.registry import LoginBackendProvider
+        from agent.vault_backends.registry import LoginBackendProvider, prefixes_overlap
 
         clean_name = name.strip().lower() if isinstance(name, str) else ""
         if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", clean_name):
@@ -563,6 +563,13 @@ class PluginContext:
                 raise ValueError(f"stock backend name {clean_name!r} is reserved")
             if prefix in stock_prefixes.values():
                 raise ValueError(f"stock handle prefix {prefix!r} is reserved")
+            if any(
+                prefixes_overlap(prefix, stock_prefix)
+                for stock_prefix in stock_prefixes.values()
+            ):
+                raise ValueError(
+                    f"handle prefix {prefix!r} overlaps reserved stock prefix"
+                )
 
         provider = LoginBackendProvider(
             name=clean_name,
