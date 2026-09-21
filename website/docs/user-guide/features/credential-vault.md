@@ -67,6 +67,13 @@ origins; nothing is inferred beyond the URLs saved on the item.
 Prefer not to use a detected manager? `hermes vault sources --disable bitwarden`,
 or the switch in **Settings → Passwords & Logins**.
 
+### Plugin login sources
+
+Plugins can add login sources. With explicit capability consent, a plugin can
+replace the stock 1Password or Bitwarden source. Plugins do not change the
+browser tool schema, add secret-listing tools, or control the browser fill
+policy. They cannot replace the local encrypted vault.
+
 ## Paying and filling addresses
 
 Cards and addresses work the same way as logins: saved once (**Settings →

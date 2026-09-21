@@ -26,6 +26,7 @@ Hermes has several distinct pluggable interfaces — some use Python `register_*
 | A **web-search / extract backend** | [Web Search Provider Plugins](../web-search-provider-plugin.md) |
 | A **cloud browser backend** (Browserbase-style CDP session provider) | [Browser Provider Plugins](../browser-provider-plugin.md) |
 | A **secret-manager backend** (vault / password manager / OS keystore) | [Secret Source Plugins](../secret-source-plugin.md) |
+| A browser credential-vault **login source** | [Register a login backend](#register-a-login-backend) |
 | A **dashboard OIDC/auth provider** | [Web Dashboard — custom providers](../../user-guide/features/web-dashboard.md#custom-providers) — `ctx.register_dashboard_auth_provider()` |
 | A **TTS backend** (any CLI — Piper, VoxCPM, Kokoro, voice cloning, …) | [TTS custom command providers](../../user-guide/features/tts.md#custom-command-providers) — config-driven, no Python needed |
 | An **STT backend** (custom whisper / ASR CLI) | [Voice Message Transcription](../../user-guide/features/tts.md#voice-message-transcription-stt) — set `HERMES_LOCAL_STT_COMMAND` to an argv-tokenized template |
@@ -262,12 +263,13 @@ def register(ctx):
 
 Known capability ids: `tools.override`, `llm.provider_override`,
 `llm.model_override`, `llm.agent_id_override`, `llm.profile_override`,
-`llm.task_override` (see `hermes_cli/plugin_capabilities.py` for the
-canonical registry). Unknown ids are ignored. The older per-capability
-config keys (`plugins.entries.<id>.allow_tool_override`, …) still work but
-are deprecated — declare capabilities instead so users get a single,
-auditable consent screen. Capabilities are consent + audit, **not a
-sandbox**: they gate host API surfaces, nothing more.
+`llm.task_override`, and `vault.login_backend_replace` (see
+`hermes_cli/plugin_capabilities.py` for the canonical registry). Unknown ids
+are ignored. The older per-capability config keys
+(`plugins.entries.<id>.allow_tool_override`, …) still work but are deprecated
+— declare capabilities instead so users get a single, auditable consent
+screen. Capabilities are consent + audit, **not a sandbox**: they gate host
+API surfaces, nothing more.
 
 **Pip-distributed plugins** have no `plugin.yaml` directory once installed,
 so declare capabilities in distribution metadata instead, via the companion
@@ -962,6 +964,112 @@ for pre-authorizing a plugin that has not adopted the manifest block.
 The same grant also gates `deregister()`: without it, a plugin cannot
 remove a tool it does not own (which would otherwise be a way around the
 override check).
+
+### Register a login backend
+
+A plugin can add a login source to the browser credential vault. Register a
+factory in `register(ctx)`:
+
+```python
+def register(ctx):
+    ctx.register_login_backend(
+        BrokerBackend,
+        name="broker",
+        display_name="Company credential broker",
+        prefix="broker:",
+        needs_unlock=True,
+    )
+```
+
+The `PluginContext` method signature is:
+
+```python
+def register_login_backend(
+    self,
+    factory: Callable[[Mapping[str, Any]], "LoginBackend"],
+    *,
+    name: str,
+    display_name: str,
+    prefix: str,
+    needs_unlock: bool = False,
+    replace_stock: bool = False,
+) -> PluginRegistration:
+    ...
+```
+
+The factory contract is:
+
+```python
+class BrokerBackend(LoginBackend):
+    def __init__(self, config: Mapping[str, Any]):
+        ...
+```
+
+Hermes calls the factory with only the `vault.<name>` configuration mapping.
+The factory must return a `LoginBackend`. The returned backend must use the
+registered `name` and `prefix`. Its `display_name` and `needs_unlock` values
+must also match the registration.
+
+Implement `list_items()`, `get_meta()`, and `resolve_password()`.
+`list_items()` and `get_meta()` return metadata only. Keep password resolution
+and optional `resolve_otp()` resolution on the server. Do not return a password,
+one-time code, session token, or unlock value to the model. Registration
+metadata is public. Never put credentials in `name`, `display_name`, `prefix`,
+or other registration fields.
+
+If `needs_unlock` is true, report the session lock state through
+`is_unlocked()`. While locked, `resolve_password()` raises `UnlockRequired` so
+the interactive surface can ask the user to unlock the source. Do not add an
+unlock tool for the model.
+
+Names must match `[a-z0-9][a-z0-9_-]{0,63}`. Prefixes must be non-empty.
+Hermes rejects a duplicate name, a duplicate prefix, and prefixes that overlap
+an existing or reserved prefix. A conflict does not replace the existing
+registration. The first successful registration keeps the slot, and a later
+conflicting registration raises an error.
+
+Registrations belong to the active `PluginManager` and profile. They are not
+shared with another profile. The returned `PluginRegistration` owns the
+registration. Plugin unload, force reload, or `PluginRegistration.dispose()`
+removes it. Cleanup is identity-checked, so an old registration cannot remove
+a later generation.
+
+This API follows the [native plugin compatibility
+contract](#native-plugin-compatibility-contract). Hermes can add optional
+parameters with defaults, but does not silently change an existing
+registration. There is no implicit replacement.
+
+#### Replace a stock external login backend
+
+A plugin can replace only the stock 1Password or Bitwarden login backend. The
+plugin must declare this capability in `plugin.yaml`:
+
+```yaml
+capabilities:
+  - vault.login_backend_replace
+```
+
+The user must grant the capability. Without consent,
+`register_login_backend(..., replace_stock=True)` raises `PermissionError`.
+
+Register the replacement explicitly:
+
+```python
+ctx.register_login_backend(
+    BrokerBitwardenBackend,
+    name="bitwarden",
+    display_name="Broker Bitwarden",
+    prefix="bw:",
+    needs_unlock=True,
+    replace_stock=True,
+)
+```
+
+The replacement name must be `onepassword` or `bitwarden`. Its prefix must
+remain exact: `op:` for 1Password or `bw:` for Bitwarden. A plugin cannot
+replace the local encrypted vault. Stock replacement changes only the external
+login backend. The core browser vault tools, tool schemas, origin checks,
+approval rules, redaction, and fill policy remain host-owned.
 
 ### Register multiple hooks
 
