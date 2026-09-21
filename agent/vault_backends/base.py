@@ -120,8 +120,12 @@ def _stock_backend_providers() -> tuple["LoginBackendProvider", ...]:
     )
 
 
-def external_backend_providers() -> tuple["LoginBackendProvider", ...]:
-    """Stock providers with scoped plugin replacements/appendages overlaid."""
+def available_backend_providers() -> tuple["LoginBackendProvider", ...]:
+    """All available backend providers: stock (1Password, Bitwarden) with plugin overlays and additions.
+
+    Stock providers may be replaced by plugin providers when replace_stock=True and capability is granted.
+    Plugin providers not replacing stock are appended in sorted order.
+    """
     from agent.vault_backends.registry import list_providers
 
     plugin_providers = list_providers()
@@ -184,7 +188,7 @@ def enabled_backends() -> List[LoginBackend]:
 
     cfg = _cfg()
     out: List[LoginBackend] = [LocalLoginBackend()]
-    for provider in external_backend_providers():
+    for provider in available_backend_providers():
         section = cfg.get(provider.name) or {}
         if isinstance(section, dict) and section.get("enabled") is False:
             continue

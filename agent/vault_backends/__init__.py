@@ -18,7 +18,7 @@ from agent.vault_backends.base import (
     UnlockRequired,
     backend_for_handle,
     enabled_backends,
-    external_backend_providers,
+    available_backend_providers,
 )
 
 __all__ = [
@@ -26,5 +26,5 @@ __all__ = [
     "UnlockRequired",
     "backend_for_handle",
     "enabled_backends",
-    "external_backend_providers",
+    "available_backend_providers",
 ]

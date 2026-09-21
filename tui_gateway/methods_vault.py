@@ -61,13 +61,13 @@ def _(rid, params: dict) -> dict:
 @_profile_scoped
 def _(rid, params: dict) -> dict:
     """Status of every login source: {name, display_name, enabled, needs_unlock, unlocked, installed}."""
-    from agent.vault_backends import enabled_backends, external_backend_providers
+    from agent.vault_backends import enabled_backends, available_backend_providers
     from agent.vault_backends.base import provider_is_installed
 
     enabled = {b.name: b for b in enabled_backends()}
     rows = [{"name": "local", "display_name": "Hermes vault", "enabled": True, "needs_unlock": False,
              "unlocked": True, "installed": True}]
-    for provider in external_backend_providers():
+    for provider in available_backend_providers():
         live = enabled.get(provider.name)
         rows.append({"name": provider.name, "display_name": provider.display_name, "enabled": live is not None,
                      "needs_unlock": provider.needs_unlock,
@@ -80,12 +80,12 @@ def _(rid, params: dict) -> dict:
 @_profile_scoped
 def _(rid, params: dict) -> dict:
     """Enable/disable an external manager: writes ``vault.<name>.enabled`` and locks it when disabling."""
-    from agent.vault_backends import external_backend_providers
+    from agent.vault_backends import available_backend_providers
     from agent.vault_backends.unlock import lock
     from hermes_cli.config import _ensure_dict, load_config, save_config
 
     name = str(params.get("name") or "")
-    if name not in {provider.name for provider in external_backend_providers()}:
+    if name not in {provider.name for provider in available_backend_providers()}:
         return _err(rid, 5095, f"unknown vault source: {name}")
     enabled = bool(params.get("enabled"))
     cfg = load_config()

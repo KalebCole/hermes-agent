@@ -140,13 +140,13 @@ def _cmd_list(args) -> None:
 
 def _cmd_sources(args) -> None:
     """Show the detected password managers; `--disable`/`--enable` flip the opt-out (`vault.<name>.enabled`)."""
-    from agent.vault_backends import enabled_backends, external_backend_providers
+    from agent.vault_backends import enabled_backends, available_backend_providers
     from agent.vault_backends.base import provider_is_installed
     from hermes_cli.config import _ensure_dict, load_config, save_config
 
     c = _console()
     providers = {
-        provider.name: provider for provider in external_backend_providers()
+        provider.name: provider for provider in available_backend_providers()
     }
     if args.enable or args.disable:
         name = args.enable or args.disable
