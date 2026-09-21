@@ -5,14 +5,17 @@ from __future__ import annotations
 import copy
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from hermes_cli.plugins_state import _locked_plugin_state
 
 if TYPE_CHECKING:
     from hermes_cli.plugins_ledger import PluginRegistration
+    from hermes_cli.plugins_manifest import PluginManifest
 
 _REPLACEABLE_STOCK_BACKENDS = frozenset({"onepassword", "bitwarden"})
+_GENERATION_KEY = "login_backend_generation"
 
 
 @dataclass(frozen=True)
@@ -48,6 +51,35 @@ def state_paths(
         state_path + ("prior_stock",),
         ("vault", backend_name, "enabled"),
     )
+
+
+def generation_path(plugin_id: str) -> tuple[str, ...]:
+    return ("plugins", "entries", plugin_id, _GENERATION_KEY)
+
+
+def _generation_from_raw(raw: Mapping[str, Any], plugin_id: str) -> int:
+    path = generation_path(plugin_id)
+    _validate_parent_path(raw, path[:-1])
+    missing = object()
+    generation = raw_value(raw, path, missing)
+    if generation is missing:
+        return 0
+    if type(generation) is not int or generation < 0:
+        raise ValueError(
+            f"Login backend generation {'.'.join(path)!r} must be a "
+            "non-negative integer"
+        )
+    return generation
+
+
+def read_generation(plugin_id: str) -> int:
+    """Read the host-owned activation generation for the active profile."""
+    from hermes_cli import config as config_mod
+
+    config_path = config_mod.get_config_path()
+    with _locked_plugin_state(config_path), config_mod._CONFIG_LOCK:
+        raw = config_mod.require_readable_config_before_write(config_path)
+        return _generation_from_raw(raw, plugin_id)
 
 
 def raw_value(raw: Mapping[str, Any], path: tuple[str, ...], missing: object) -> Any:
@@ -162,105 +194,235 @@ def _validate_carryover_policy(carryovers: list[LoginBackendCarryover]) -> None:
     _reject_managed_writes(paths)
 
 
-def restore_plugin_leases(plugin_id: str) -> bool:
-    """Restore every persisted active stock-backend lease owned by ``plugin_id``."""
+def _active_leases(
+    raw: Mapping[str, Any], plugin_id: str
+) -> list[
+    tuple[
+        tuple[str, ...],
+        tuple[str, ...],
+        tuple[str, ...],
+        Mapping[str, Any],
+    ]
+]:
+    missing = object()
+    backends_path = (
+        "plugins",
+        "entries",
+        plugin_id,
+        "settings",
+        "login_backends",
+    )
+    _validate_parent_path(raw, backends_path)
+    backends = raw_value(raw, backends_path, missing)
+    if backends is missing:
+        return []
+    active_leases = []
+    for backend_name, state in backends.items():
+        if not isinstance(state, Mapping):
+            raise TypeError(
+                f"Login backend activation path "
+                f"{'.'.join(backends_path + (str(backend_name),))!r} "
+                "must be a mapping"
+            )
+        active_path, rollback_path, vault_path = state_paths(
+            plugin_id, str(backend_name)
+        )
+        active = raw_value(raw, active_path, missing)
+        if active is not missing and type(active) is not bool:
+            raise TypeError(
+                f"Login backend setting {'.'.join(active_path)!r} must be a bool"
+            )
+        snapshot = raw_value(raw, rollback_path, missing)
+        if snapshot is not missing:
+            validate_snapshot(snapshot, rollback_path, missing)
+        if active is not True:
+            continue
+        if backend_name not in _REPLACEABLE_STOCK_BACKENDS:
+            raise ValueError(
+                f"Login backend lease {backend_name!r} is not a replaceable "
+                "stock backend"
+            )
+        if snapshot is missing:
+            validate_snapshot(snapshot, rollback_path, missing)
+        _validate_parent_path(raw, vault_path[:-1])
+        active_leases.append(
+            (active_path, rollback_path, vault_path, snapshot)
+        )
+    return active_leases
+
+
+def _restore_leases_in_raw(
+    raw: dict[str, Any],
+    active_leases: list[
+        tuple[
+            tuple[str, ...],
+            tuple[str, ...],
+            tuple[str, ...],
+            Mapping[str, Any],
+        ]
+    ],
+) -> None:
+    missing = object()
+    for active_path, rollback_path, vault_path, snapshot in active_leases:
+        set_raw_value(raw, active_path, False)
+        if snapshot["present"]:
+            set_raw_value(raw, vault_path, snapshot["value"])
+        else:
+            vault_section = raw_value(raw, vault_path[:-1], missing)
+            if isinstance(vault_section, dict):
+                vault_section.pop(vault_path[-1], None)
+        state = raw_value(raw, rollback_path[:-1], missing)
+        if isinstance(state, dict):
+            state.pop(rollback_path[-1], None)
+
+
+def _config_name_set(raw: Mapping[str, Any], key: str) -> set[str]:
+    plugins = raw.get("plugins")
+    value = plugins.get(key) if isinstance(plugins, Mapping) else None
+    return {item for item in value if isinstance(item, str)} if isinstance(value, list) else set()
+
+
+def disable_plugin(plugin_id: str) -> bool:
+    """Durably disable one plugin and revoke all loaded login-backend contexts."""
     from hermes_cli import config as config_mod
 
     config_path = config_mod.get_config_path()
     with _locked_plugin_state(config_path), config_mod._CONFIG_LOCK:
-        try:
-            raw = config_mod.require_readable_config_before_write(config_path)
-        except RuntimeError as exc:
-            if isinstance(exc.__cause__, TypeError):
-                raise TypeError(
-                    "Login backend activation config root must be a mapping"
-                ) from exc
-            raise
-        missing = object()
-        backends_path = (
-            "plugins",
-            "entries",
-            plugin_id,
-            "settings",
-            "login_backends",
-        )
-        _validate_parent_path(raw, backends_path)
-        backends = raw_value(raw, backends_path, missing)
-        if backends is missing:
+        raw = config_mod.require_readable_config_before_write(config_path)
+        generation = _generation_from_raw(raw, plugin_id)
+        active_leases = _active_leases(raw, plugin_id)
+        enabled = _config_name_set(raw, "enabled")
+        disabled = _config_name_set(raw, "disabled")
+        already_disabled = plugin_id not in enabled and plugin_id in disabled
+        if already_disabled and not active_leases:
             return False
 
-        active_leases: list[
-            tuple[
-                tuple[str, ...],
-                tuple[str, ...],
-                tuple[str, ...],
-                Mapping[str, Any],
-            ]
-        ] = []
-        for backend_name, state in backends.items():
-            if not isinstance(state, Mapping):
-                raise TypeError(
-                    f"Login backend activation path "
-                    f"{'.'.join(backends_path + (str(backend_name),))!r} "
-                    "must be a mapping"
-                )
-            active_path, rollback_path, vault_path = state_paths(
-                plugin_id, str(backend_name)
-            )
-            active = raw_value(raw, active_path, missing)
-            if active is not missing and type(active) is not bool:
-                raise TypeError(
-                    f"Login backend setting {'.'.join(active_path)!r} must be a bool"
-                )
-            snapshot = raw_value(raw, rollback_path, missing)
-            if snapshot is not missing:
-                validate_snapshot(snapshot, rollback_path, missing)
-            if active is not True:
-                continue
-            if backend_name not in _REPLACEABLE_STOCK_BACKENDS:
-                raise ValueError(
-                    f"Login backend lease {backend_name!r} is not a replaceable "
-                    "stock backend"
-                )
-            if snapshot is missing:
-                validate_snapshot(snapshot, rollback_path, missing)
-            _validate_parent_path(raw, vault_path[:-1])
-            active_leases.append(
-                (active_path, rollback_path, vault_path, snapshot)
-            )
-
-        if not active_leases:
-            return False
         writable_paths = {
+            generation_path(plugin_id),
+            ("plugins", "enabled"),
+            ("plugins", "disabled"),
+        }
+        writable_paths.update(
             path
             for active_path, rollback_path, vault_path, _ in active_leases
             for path in (active_path, rollback_path, vault_path)
-        }
+        )
         _reject_managed_writes(writable_paths)
-
-        for active_path, rollback_path, vault_path, snapshot in active_leases:
-            set_raw_value(raw, active_path, False)
-            if snapshot["present"]:
-                set_raw_value(raw, vault_path, snapshot["value"])
-            else:
-                vault_section = raw_value(raw, vault_path[:-1], missing)
-                if isinstance(vault_section, dict):
-                    vault_section.pop(vault_path[-1], None)
-            state = raw_value(raw, rollback_path[:-1], missing)
-            if isinstance(state, dict):
-                state.pop(rollback_path[-1], None)
-
+        _restore_leases_in_raw(raw, active_leases)
+        set_raw_value(raw, generation_path(plugin_id), generation + 1)
+        enabled.discard(plugin_id)
+        enabled.discard(plugin_id.split("/")[-1])
+        disabled.add(plugin_id)
+        plugins = raw.setdefault("plugins", {})
+        if not isinstance(plugins, dict):
+            raise TypeError("Plugin config path 'plugins' must be a mapping")
+        plugins["enabled"] = sorted(enabled)
+        plugins["disabled"] = sorted(disabled)
         config_mod.save_config(raw, strip_defaults=False)
+        return not already_disabled
+
+
+def revoke_plugin(plugin_id: str) -> None:
+    """Revoke loaded contexts and restore leases before removing a plugin tree."""
+    from hermes_cli import config as config_mod
+
+    config_path = config_mod.get_config_path()
+    with _locked_plugin_state(config_path), config_mod._CONFIG_LOCK:
+        raw = config_mod.require_readable_config_before_write(config_path)
+        generation = _generation_from_raw(raw, plugin_id)
+        active_leases = _active_leases(raw, plugin_id)
+        writable_paths = {generation_path(plugin_id)}
+        writable_paths.update(
+            path
+            for active_path, rollback_path, vault_path, _ in active_leases
+            for path in (active_path, rollback_path, vault_path)
+        )
+        _reject_managed_writes(writable_paths)
+        _restore_leases_in_raw(raw, active_leases)
+        set_raw_value(raw, generation_path(plugin_id), generation + 1)
+        config_mod.save_config(raw, strip_defaults=False)
+
+
+def _manifest_path_exists(manifest: PluginManifest) -> bool:
+    if manifest.source not in {"user", "project"}:
         return True
+    if not manifest.path:
+        return False
+    plugin_path = Path(manifest.path)
+    if not plugin_path.is_dir():
+        return False
+    native_manifest = any(
+        candidate.exists()
+        for candidate in (plugin_path / "plugin.yaml", plugin_path / "plugin.yml")
+    )
+    portable_manifest = plugin_path / "plugin.json"
+    return (
+        native_manifest
+        or portable_manifest.exists()
+        or portable_manifest.is_symlink()
+    )
 
 
-def set_active(plugin_id: str, backend_name: str, active: bool) -> None:
+def _verify_activation_eligibility(
+    raw: Mapping[str, Any],
+    plugin_id: str,
+    provider: Any,
+    manifest: PluginManifest,
+    scope: str,
+) -> None:
+    from agent.vault_backends import registry as login_backend_registry
+    from hermes_constants import hermes_home_key
+    from hermes_cli.plugin_capabilities import plugin_capability_granted
+    from hermes_cli.plugins_discovery import (
+        _get_disabled_plugins,
+        _get_enabled_plugins,
+        gate_manifest,
+    )
+
+    current = login_backend_registry.snapshot_registration(
+        provider.name, scope=scope
+    )
+    if current is not provider:
+        raise PermissionError("Login backend provider registration is no longer current")
+    if hermes_home_key() != scope:
+        raise PermissionError(
+            "Login backend provider belongs to a different profile"
+        )
+    try:
+        generation = _generation_from_raw(raw, plugin_id)
+    except ValueError as exc:
+        raise PermissionError(str(exc)) from exc
+    if generation != provider.activation_generation:
+        raise PermissionError("Login backend provider activation generation is revoked")
+    verdict = gate_manifest(
+        manifest, _get_disabled_plugins(), _get_enabled_plugins()
+    )
+    if verdict.action == "placeholder":
+        raise PermissionError("Login backend provider plugin is no longer enabled")
+    if not _manifest_path_exists(manifest):
+        raise PermissionError("Login backend provider plugin path is no longer installed")
+    if not plugin_capability_granted(
+        plugin_id, "vault.login_backend_replace", config=raw
+    ):
+        raise PermissionError(
+            "Login backend replacement capability is no longer granted"
+        )
+
+
+def set_active(
+    plugin_id: str,
+    backend_name: str,
+    active: bool,
+    *,
+    provider: Any,
+    manifest: PluginManifest,
+    scope: str,
+) -> None:
     from hermes_cli import config as config_mod
 
     active_path, rollback_path, vault_path = state_paths(plugin_id, backend_name)
     config_path = config_mod.get_config_path()
     with _locked_plugin_state(config_path), config_mod._CONFIG_LOCK:
-        _reject_managed_writes({active_path, rollback_path, vault_path})
         try:
             raw = config_mod.require_readable_config_before_write(config_path)
         except RuntimeError as exc:
@@ -269,6 +431,10 @@ def set_active(plugin_id: str, backend_name: str, active: bool) -> None:
                     "Login backend activation config root must be a mapping"
                 ) from exc
             raise
+        _verify_activation_eligibility(
+            raw, plugin_id, provider, manifest, scope
+        )
+        _reject_managed_writes({active_path, rollback_path, vault_path})
         missing = object()
 
         for path in (active_path[:-1], rollback_path[:-1], vault_path[:-1]):

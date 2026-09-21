@@ -1130,8 +1130,23 @@ provider. Force rediscovery carries active records across the unload phase:
 successful re-registration preserves them, while an omitted, disabled, or
 failed replacement is restored after discovery, including when discovery
 raises. Routine process shutdown/unload-all does not mutate configuration.
-Cleanup is profile-scoped and generation-checked, so stale registrations cannot
-restore a later generation or another profile.
+Cleanup is profile-scoped and generation-checked. Hermes owns the integer
+`plugins.entries.<plugin_id>.login_backend_generation`; it is deliberately
+outside plugin `settings`, so `ctx.set_config()` cannot modify it. Missing means
+generation zero. Disabling or removing the plugin restores active leases and
+increments this generation in the same locked config transaction, even when no
+lease is active. Repeating an already-complete disable is a no-op.
+
+Each registered provider captures the current generation. Before
+`set_login_backend_active()` changes configuration, Hermes verifies that the
+same provider object still owns the registry slot, its generation is current,
+the canonical manifest gate still permits the plugin, user/project package and
+manifest paths still exist, and `vault.login_backend_replace` remains granted.
+Failure raises `PermissionError` without changing activation or stock state.
+Re-enabling or reinstalling never revives an old context: only a new discovery
+captures the new generation. This host-owned eligibility check is part of the
+native compatibility contract; plugins must not persist or synthesize their own
+generation.
 
 The active, rollback, and stock dotted paths must all be writable under
 managed-scope policy, and managed installs reject the operation. Hermes holds

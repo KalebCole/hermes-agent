@@ -51,6 +51,7 @@ from hermes_cli.plugins_loader import (
 )
 from hermes_cli.plugins_login_backend import (
     LoginBackendCarryover,
+    read_generation as read_login_backend_generation,
     restore_carryovers,
     set_active as set_login_backend_active,
 )
@@ -237,6 +238,7 @@ class PluginContext:
         self.manifest = manifest
         self._manager = manager
         self._llm: Any = None  # lazy; tests preseed it (see ``llm``)
+        self._login_backend_providers: Dict[str, Any] = {}
 
     @property
     def plugin_id(self) -> str:
@@ -584,6 +586,7 @@ class PluginContext:
             factory=factory,
             replaces_stock=replace_stock,
             owner_plugin_id=self.plugin_id,
+            activation_generation=read_login_backend_generation(self.plugin_id),
         )
         scope = self._manager.scope_key
         previous = login_backend_registry.snapshot_registration(clean_name, scope=scope)
@@ -597,6 +600,7 @@ class PluginContext:
             previous,
             metadata=provider,
         )
+        self._login_backend_providers[clean_name] = provider
         logger.info(
             "Plugin %s registered login backend name=%s prefix=%s replacement=%s",
             self.plugin_id,
@@ -610,9 +614,7 @@ class PluginContext:
         """Atomically toggle this plugin's registered stock-backend replacement."""
         from agent.vault_backends import registry as login_backend_registry
 
-        provider = login_backend_registry.snapshot_registration(
-            name, scope=self._manager.scope_key
-        )
+        provider = self._login_backend_providers.get(name)
         if (
             provider is None
             or not provider.replaces_stock
@@ -625,7 +627,14 @@ class PluginContext:
         if not isinstance(active, bool):
             raise TypeError("active must be a bool")
 
-        set_login_backend_active(self.plugin_id, provider.name, active)
+        set_login_backend_active(
+            self.plugin_id,
+            provider.name,
+            active,
+            provider=provider,
+            manifest=self.manifest,
+            scope=self._manager.scope_key,
+        )
 
     def call_mcp(
         self, server: str, tool: str, arguments: Optional[Dict[str, Any]] = None,

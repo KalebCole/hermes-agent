@@ -686,3 +686,46 @@ git --no-pager diff --check
 ```
 
 Expected: all commands pass.
+
+### Task 7: Add durable host-owned revocation generations
+
+**Files:**
+- Modify: `agent/vault_backends/registry.py`
+- Modify: `hermes_cli/plugins.py`
+- Modify: `hermes_cli/plugins_login_backend.py`
+- Modify: `hermes_cli/plugins_cmd.py`
+- Modify: `tests/hermes_cli/test_plugins_login_backend_registration.py`
+- Modify: `tests/hermes_cli/test_plugins_cmd_login_backend_cleanup.py`
+- Modify: `website/docs/developer-guide/plugins/index.md`
+
+**Compatibility contract:**
+
+- Hermes owns
+  `plugins.entries.<plugin_id>.login_backend_generation` outside plugin
+  `settings`; missing means zero, while bool, non-integer, and negative values
+  fail closed.
+- A `LoginBackendProvider` captures the active profile's generation when the
+  real discovery path registers it.
+- CLI and dashboard disable/remove restore active leases and increment the
+  generation in the same locked config transaction. An already-disabled plugin
+  with a stranded lease is repaired and revoked once; a repeated completed
+  disable does not rewrite or increment.
+- `PluginContext.set_login_backend_active()` keeps its public signature but
+  verifies exact registry identity, generation equality, the canonical
+  `gate_manifest()` verdict using `_get_enabled_plugins()` and
+  `_get_disabled_plugins()`, user/project package and manifest existence, and
+  the live `vault.login_backend_replace` grant before any mutation.
+- Re-enable/reinstall requires a new discovery and provider generation. An old
+  loaded context remains rejected.
+- Generation and lease writes honor managed-config policy. A malformed or
+  managed generation aborts disable/remove without changing config, registry,
+  or the installed plugin tree.
+
+**TDD coverage:**
+
+- Real `PluginManager` activation followed by CLI/dashboard disable/remove,
+  stale same-process activation rejection, and stock state after restart.
+- Re-enable/reinstall plus force/new discovery accepts only the new provider.
+- Capability revocation, manual durable disable, removed manifest, profile
+  isolation, malformed generation, managed generation, and repeated-disable
+  idempotency.

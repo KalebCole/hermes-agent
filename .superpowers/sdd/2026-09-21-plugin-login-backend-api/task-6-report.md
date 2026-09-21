@@ -218,6 +218,88 @@ compatibility, and lint commands.
 Fixed the replacement activation transaction so it preserves the stock
 backend's raw pre-activation state instead of writing inverse booleans.
 
+---
+
+# Task 7 Report — Durable host-owned revocation generation
+
+## Status
+
+Complete in commit `fix(vault): add durable plugin revocation generations`
+(this commit).
+
+## TDD evidence
+
+The first focused RED run covered real CLI/dashboard command paths:
+
+```bash
+scripts/run_tests.sh \
+  tests/hermes_cli/test_plugins_login_backend_registration.py \
+  tests/hermes_cli/test_plugins_cmd_login_backend_cleanup.py \
+  -k 'revokes_loaded or reenable_force or reinstall_new or rechecks_capability or generation_is_profile or already_disabled or malformed_generation or managed_generation' \
+  --tb=short
+```
+
+The cleanup file produced five expected failures: the generation key was
+missing, malformed generations did not abort, and a managed generation did not
+block disable. The registration tests also demonstrated that stale loaded
+contexts could reactivate after disable/remove.
+
+During review, a separate profile-scope RED test proved that a profile-A
+context could mutate profile B before the explicit scope fence:
+
+```text
+Failed: DID NOT RAISE PermissionError
+```
+
+After implementation, the focused pair passed:
+
+```text
+163 tests passed, 0 failed
+```
+
+## Contract implemented
+
+- Hermes owns
+  `plugins.entries.<plugin_id>.login_backend_generation`; it is outside
+  plugin-controlled `settings`.
+- Missing means generation zero. Bool, non-integer, negative, malformed-parent,
+  and unreadable values fail closed.
+- Every `LoginBackendProvider` captures its profile generation during real
+  registration.
+- CLI/dashboard disable restores leases, increments generation, and moves the
+  enabled/disabled lists in one locked config transaction.
+- CLI/dashboard remove restores leases and increments generation before the
+  plugin tree is deleted.
+- An already-disabled plugin with a stranded active lease is repaired and
+  incremented once; repeating the command does not rewrite or increment.
+- Activation verifies exact provider identity, owning profile, generation,
+  canonical manifest eligibility, user/project package plus manifest
+  existence, and the live replacement capability before any config mutation.
+- Re-enable/reinstall requires new discovery. The new provider can activate;
+  the old context remains rejected.
+- Generation and lease paths participate in managed-config validation.
+
+## Verification
+
+Focused vault/plugin and command/manager suites:
+
+```text
+355 tests passed, 0 failed
+```
+
+Broader plugin registration/ownership/API compatibility suites:
+
+```text
+43 tests passed, 0 failed
+```
+
+Ruff, compileall, compatibility-pointer validation, and `git diff --check`
+all exited zero.
+
+## Concerns
+
+None.
+
 - The dynamic rollback key is
   `plugins.entries.<plugin_id>.settings.prior_stock_<backend_name>`.
 - First activation snapshots the stock key as `{present: bool, value?: Any}`,

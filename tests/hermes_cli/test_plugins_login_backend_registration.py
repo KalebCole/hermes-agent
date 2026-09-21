@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import json
+import shutil
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -379,9 +380,42 @@ def test_real_discovery_registers_login_backend_in_manager_scope():
     )
     assert manager._plugins["broker-plugin"].enabled is True
     assert provider is not None
+    assert provider.activation_generation == 0
     assert provider.prefix == "broker:"
     assert provider.needs_unlock is True
     assert provider.create({}).name == "broker"
+
+
+@pytest.mark.parametrize("generation", [True, -1, "1"])
+def test_discovery_rejects_malformed_login_backend_generation_without_registration(
+    generation,
+):
+    home = Path(os.environ["HERMES_HOME"])
+    _write_plugin(
+        home,
+        "broker-plugin",
+        backend_name="broker",
+        display_name="Broker vault",
+        prefix="broker:",
+    )
+    _configure_plugins(home, ["broker-plugin"])
+    path = home / "config.yaml"
+    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    raw.setdefault("plugins", {}).setdefault("entries", {}).setdefault(
+        "broker-plugin", {}
+    )["login_backend_generation"] = generation
+    path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    before = path.read_bytes()
+
+    manager = PluginManager()
+    manager.discover_and_load()
+
+    assert manager._plugins["broker-plugin"].enabled is False
+    assert "non-negative integer" in manager._plugins["broker-plugin"].error
+    assert login_backend_registry.snapshot_registration(
+        "broker", scope=manager.scope_key
+    ) is None
+    assert path.read_bytes() == before
 
 
 def test_real_discovery_routes_login_backend_with_its_own_config_and_reloads_once():
@@ -1047,6 +1081,291 @@ def _assert_bitwarden_replacement_cleaned(config_path: Path) -> None:
     assert state == {"enabled": False}
     assert raw["vault"]["bitwarden"]["enabled"] == "bitwarden-user-value"
     assert raw["vault"]["onepassword"]["enabled"] == "onepassword-user-value"
+
+
+def _active_replacement_manager(home: Path) -> tuple[PluginManager, object, Path]:
+    _write_plugin(
+        home,
+        "broker-plugin",
+        backend_name="bitwarden",
+        display_name="Broker Bitwarden",
+        prefix="bw:",
+        replace_stock=True,
+        class_name="BrokerBitwardenBackend",
+    )
+    _configure_plugins(
+        home,
+        ["broker-plugin"],
+        grants={"broker-plugin": ["vault.login_backend_replace"]},
+        vault={"bitwarden": {"enabled": "stock-value"}},
+    )
+    manager = PluginManager()
+    manager.discover_and_load()
+    module = manager._plugins["broker-plugin"].module
+    module.set_active("bitwarden", True)
+    return manager, module, home / "config.yaml"
+
+
+def _assert_stale_activation_rejected(
+    module: object, config_path: Path, provider: object
+) -> None:
+    before = config_path.read_bytes()
+    with pytest.raises(PermissionError):
+        module.set_active("bitwarden", True)
+    assert config_path.read_bytes() == before
+    assert login_backend_registry.snapshot_registration(
+        "bitwarden", scope=str(config_path.parent.resolve())
+    ) is provider
+
+
+@pytest.mark.parametrize("surface", ["cli", "dashboard"])
+def test_disable_revokes_loaded_replacement_context_and_restores_stock(surface: str):
+    from hermes_cli import plugins_cmd
+
+    home = Path(os.environ["HERMES_HOME"])
+    manager, module, config_path = _active_replacement_manager(home)
+    provider = login_backend_registry.snapshot_registration(
+        "bitwarden", scope=manager.scope_key
+    )
+
+    if surface == "cli":
+        plugins_cmd.cmd_disable("broker-plugin")
+    else:
+        assert plugins_cmd.dashboard_set_agent_plugin_enabled(
+            "broker-plugin", enabled=False
+        )["ok"] is True
+
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert raw["vault"]["bitwarden"]["enabled"] == "stock-value"
+    assert raw["plugins"]["entries"]["broker-plugin"][
+        "login_backend_generation"
+    ] == 1
+    _assert_stale_activation_rejected(module, config_path, provider)
+
+    login_backend_registry._reset_for_tests()
+    restarted = PluginManager()
+    restarted.discover_and_load()
+    assert login_backend_registry.snapshot_registration(
+        "bitwarden", scope=restarted.scope_key
+    ) is None
+    providers = {
+        provider.name: provider for provider in available_backend_providers()
+    }
+    assert providers["bitwarden"].display_name == "Bitwarden"
+
+
+@pytest.mark.parametrize("surface", ["cli", "dashboard"])
+def test_remove_revokes_loaded_replacement_context_and_restores_stock(surface: str):
+    from hermes_cli import plugins_cmd
+
+    home = Path(os.environ["HERMES_HOME"])
+    manager, module, config_path = _active_replacement_manager(home)
+    provider = login_backend_registry.snapshot_registration(
+        "bitwarden", scope=manager.scope_key
+    )
+
+    if surface == "cli":
+        plugins_cmd.cmd_remove("broker-plugin")
+    else:
+        assert plugins_cmd.dashboard_remove_user_plugin("broker-plugin")["ok"] is True
+
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert raw["vault"]["bitwarden"]["enabled"] == "stock-value"
+    assert raw["plugins"]["entries"]["broker-plugin"][
+        "login_backend_generation"
+    ] == 1
+    _assert_stale_activation_rejected(module, config_path, provider)
+
+    login_backend_registry._reset_for_tests()
+    restarted = PluginManager()
+    restarted.discover_and_load()
+    assert login_backend_registry.snapshot_registration(
+        "bitwarden", scope=restarted.scope_key
+    ) is None
+    providers = {
+        provider.name: provider for provider in available_backend_providers()
+    }
+    assert providers["bitwarden"].display_name == "Bitwarden"
+
+
+def test_reenable_force_discovery_uses_new_generation_and_keeps_old_context_revoked():
+    from hermes_cli import plugins_cmd
+
+    home = Path(os.environ["HERMES_HOME"])
+    manager, old_module, config_path = _active_replacement_manager(home)
+    plugins_cmd.cmd_disable("broker-plugin")
+    plugins_cmd.cmd_enable("broker-plugin")
+
+    manager.discover_and_load(force=True)
+    new_module = manager._plugins["broker-plugin"].module
+    provider = login_backend_registry.snapshot_registration(
+        "bitwarden", scope=manager.scope_key
+    )
+
+    _assert_stale_activation_rejected(old_module, config_path, provider)
+    new_module.set_active("bitwarden", True)
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert raw["plugins"]["entries"]["broker-plugin"][
+        "login_backend_generation"
+    ] == 1
+    assert raw["plugins"]["entries"]["broker-plugin"]["settings"][
+        "login_backends"
+    ]["bitwarden"]["enabled"] is True
+
+
+def test_reinstall_new_discovery_uses_new_generation_and_keeps_old_context_revoked():
+    from hermes_cli import plugins_cmd
+
+    home = Path(os.environ["HERMES_HOME"])
+    _, old_module, config_path = _active_replacement_manager(home)
+    plugins_cmd.cmd_remove("broker-plugin")
+    _write_plugin(
+        home,
+        "broker-plugin",
+        backend_name="bitwarden",
+        display_name="Broker Bitwarden",
+        prefix="bw:",
+        replace_stock=True,
+        class_name="BrokerBitwardenBackend",
+    )
+
+    login_backend_registry._reset_for_tests()
+    manager = PluginManager()
+    manager.discover_and_load()
+    new_module = manager._plugins["broker-plugin"].module
+    provider = login_backend_registry.snapshot_registration(
+        "bitwarden", scope=manager.scope_key
+    )
+
+    _assert_stale_activation_rejected(old_module, config_path, provider)
+    new_module.set_active("bitwarden", True)
+
+
+def test_loaded_replacement_rechecks_capability_manifest_gate_and_plugin_path():
+    home = Path(os.environ["HERMES_HOME"])
+    manager, module, config_path = _active_replacement_manager(home)
+    module.set_active("bitwarden", False)
+    provider = login_backend_registry.snapshot_registration(
+        "bitwarden", scope=manager.scope_key
+    )
+
+    mutations = [
+        lambda raw: raw["plugins"]["entries"]["broker-plugin"].update(
+            {"granted_capabilities": []}
+        ),
+        lambda raw: raw["plugins"].update({"disabled": ["broker-plugin"]}),
+    ]
+    for mutate in mutations:
+        raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        mutate(raw)
+        config_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+        _assert_stale_activation_rejected(module, config_path, provider)
+        raw["plugins"]["disabled"] = []
+        raw["plugins"]["entries"]["broker-plugin"][
+            "granted_capabilities"
+        ] = ["vault.login_backend_replace"]
+        config_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+
+    (home / "plugins" / "broker-plugin" / "plugin.yaml").unlink()
+    _assert_stale_activation_rejected(module, config_path, provider)
+
+
+def test_loaded_replacement_rejects_removed_plugin_directory():
+    home = Path(os.environ["HERMES_HOME"])
+    manager, module, config_path = _active_replacement_manager(home)
+    module.set_active("bitwarden", False)
+    provider = login_backend_registry.snapshot_registration(
+        "bitwarden", scope=manager.scope_key
+    )
+
+    shutil.rmtree(home / "plugins" / "broker-plugin")
+
+    _assert_stale_activation_rejected(module, config_path, provider)
+
+
+def test_managed_generation_aborts_disable_without_revoking_registry():
+    from hermes_cli import managed_scope, plugins_cmd
+
+    home = Path(os.environ["HERMES_HOME"])
+    manager, _, config_path = _active_replacement_manager(home)
+    provider = login_backend_registry.snapshot_registration(
+        "bitwarden", scope=manager.scope_key
+    )
+    before = config_path.read_bytes()
+    generation_path = (
+        "plugins.entries.broker-plugin.login_backend_generation"
+    )
+
+    with patch.object(
+        managed_scope,
+        "is_key_managed",
+        side_effect=lambda key: key == generation_path,
+    ), pytest.raises(SystemExit):
+        plugins_cmd.cmd_disable("broker-plugin")
+
+    assert config_path.read_bytes() == before
+    assert login_backend_registry.snapshot_registration(
+        "bitwarden", scope=manager.scope_key
+    ) is provider
+
+
+def test_generation_is_profile_scoped_and_malformed_values_fail_closed():
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    root = Path(os.environ["HERMES_HOME"]).parent
+    home_a = root / "generation-profile-a"
+    home_b = root / "generation-profile-b"
+    token_a = set_hermes_home_override(home_a)
+    try:
+        manager_a, module_a, config_a = _active_replacement_manager(home_a)
+    finally:
+        reset_hermes_home_override(token_a)
+    token_b = set_hermes_home_override(home_b)
+    try:
+        manager_b, module_b, config_b = _active_replacement_manager(home_b)
+        module_b.set_active("bitwarden", False)
+        before_b = config_b.read_bytes()
+        with pytest.raises(PermissionError):
+            module_a.set_active("bitwarden", False)
+        assert config_b.read_bytes() == before_b
+    finally:
+        reset_hermes_home_override(token_b)
+
+    token_a = set_hermes_home_override(home_a)
+    try:
+        from hermes_cli import plugins_cmd
+
+        plugins_cmd.cmd_disable("broker-plugin")
+        with pytest.raises(PermissionError):
+            module_a.set_active("bitwarden", True)
+    finally:
+        reset_hermes_home_override(token_a)
+
+    token_b = set_hermes_home_override(home_b)
+    try:
+        module_b.set_active("bitwarden", True)
+    finally:
+        reset_hermes_home_override(token_b)
+    assert config_b.read_bytes() != before_b
+    assert login_backend_registry.snapshot_registration(
+        "bitwarden", scope=manager_a.scope_key
+    ) is not login_backend_registry.snapshot_registration(
+        "bitwarden", scope=manager_b.scope_key
+    )
+
+    raw_b = yaml.safe_load(config_b.read_text(encoding="utf-8"))
+    raw_b["plugins"]["entries"]["broker-plugin"][
+        "login_backend_generation"
+    ] = True
+    config_b.write_text(yaml.safe_dump(raw_b), encoding="utf-8")
+    before_malformed = config_b.read_bytes()
+    token_b = set_hermes_home_override(home_b)
+    try:
+        with pytest.raises(PermissionError):
+            module_b.set_active("bitwarden", False)
+    finally:
+        reset_hermes_home_override(token_b)
+    assert config_b.read_bytes() == before_malformed
 
 
 def test_targeted_unload_restores_active_replacement_and_consumes_snapshot():

@@ -117,6 +117,10 @@ def test_dashboard_disable_restores_already_disabled_active_lease_idempotently()
     assert second == {"ok": True, "name": "broker-plugin", "unchanged": True}
     assert config_path.read_bytes() == after_first
     _assert_lease_restored(config_path)
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert raw["plugins"]["entries"]["broker-plugin"][
+        "login_backend_generation"
+    ] == 1
 
 
 def test_dashboard_remove_restores_persisted_lease_before_deleting_plugin():
@@ -191,3 +195,77 @@ def test_disable_restoration_uses_current_profile_only():
 
     _assert_lease_restored(config_a)
     assert config_b.read_bytes() == before_b
+
+
+@pytest.mark.parametrize(
+    "action", ["cli-disable", "cli-remove", "dashboard-disable", "dashboard-remove"]
+)
+@pytest.mark.parametrize("malformed", [True, -1, "1"])
+def test_disable_remove_rejects_malformed_generation_without_mutation(
+    action: str, malformed
+):
+    home = Path(os.environ["HERMES_HOME"])
+    config_path = _write_active_lease(home)
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    raw["plugins"]["entries"]["broker-plugin"][
+        "login_backend_generation"
+    ] = malformed
+    config_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    before = config_path.read_bytes()
+
+    if action == "cli-disable":
+        with pytest.raises(SystemExit):
+            plugins_cmd.cmd_disable("broker-plugin")
+    elif action == "cli-remove":
+        with pytest.raises(SystemExit):
+            plugins_cmd.cmd_remove("broker-plugin")
+    elif action == "dashboard-disable":
+        result = plugins_cmd.dashboard_set_agent_plugin_enabled(
+            "broker-plugin", enabled=False
+        )
+        assert result["ok"] is False
+    else:
+        result = plugins_cmd.dashboard_remove_user_plugin("broker-plugin")
+        assert result["ok"] is False
+
+    assert config_path.read_bytes() == before
+    assert (home / "plugins" / "broker-plugin").exists()
+
+
+@pytest.mark.parametrize(
+    "action", ["cli-disable", "cli-remove", "dashboard-disable", "dashboard-remove"]
+)
+def test_disable_remove_rejects_managed_generation_without_restoring_lease(
+    action: str,
+):
+    from hermes_cli import managed_scope
+
+    home = Path(os.environ["HERMES_HOME"])
+    config_path = _write_active_lease(home)
+    before = config_path.read_bytes()
+    generation_path = (
+        "plugins.entries.broker-plugin.login_backend_generation"
+    )
+
+    with patch.object(
+        managed_scope,
+        "is_key_managed",
+        side_effect=lambda key: key == generation_path,
+    ):
+        if action == "cli-disable":
+            with pytest.raises(SystemExit):
+                plugins_cmd.cmd_disable("broker-plugin")
+        elif action == "cli-remove":
+            with pytest.raises(SystemExit):
+                plugins_cmd.cmd_remove("broker-plugin")
+        elif action == "dashboard-disable":
+            result = plugins_cmd.dashboard_set_agent_plugin_enabled(
+                "broker-plugin", enabled=False
+            )
+            assert result["ok"] is False
+        else:
+            result = plugins_cmd.dashboard_remove_user_plugin("broker-plugin")
+            assert result["ok"] is False
+
+    assert config_path.read_bytes() == before
+    assert (home / "plugins" / "broker-plugin").exists()

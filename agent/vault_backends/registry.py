@@ -22,6 +22,7 @@ class LoginBackendProvider:
     factory: LoginBackendFactory
     replaces_stock: bool = False
     owner_plugin_id: str | None = None
+    activation_generation: int = 0
 
     def create(self, config: Mapping[str, Any]) -> LoginBackend:
         backend = self.factory(config)
@@ -60,6 +61,11 @@ def _validate_provider(provider: LoginBackendProvider) -> None:
         raise ValueError("handle prefix must be a non-empty string")
     if not callable(provider.factory):
         raise TypeError("login backend factory must be callable")
+    if (
+        type(provider.activation_generation) is not int
+        or provider.activation_generation < 0
+    ):
+        raise ValueError("activation generation must be a non-negative integer")
 
 
 def register_provider(provider: LoginBackendProvider, *, scope: str) -> None:
