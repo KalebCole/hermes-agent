@@ -1102,9 +1102,11 @@ Deactivation writes `login_backend_enabled: false`, restores the exact prior
 stock value or its exact absence when a valid snapshot exists, and consumes the
 snapshot. Without a valid snapshot it leaves the stock key untouched. Repeated
 deactivation is a no-op, so later user changes are never overwritten. The
-provider registry records the owner, and selection uses the replacement unless
-that owner setting is explicitly `false`. While the replacement is active, the
-stock vault's disabled flag does not suppress it.
+provider registry records the owner, and selection uses the replacement only
+when the raw owner setting `login_backend_enabled` is exactly `true`. Missing,
+false, malformed, or unreadable settings leave the replacement inactive; plugin
+manifest defaults are not consulted. While the replacement is active, the stock
+vault's disabled flag does not suppress it.
 
 The active, rollback, and stock dotted paths must all be writable under
 managed-scope policy, and managed installs reject the operation. Hermes holds

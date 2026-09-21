@@ -846,7 +846,7 @@ def test_replacement_deactivation_without_snapshot_does_not_touch_stock_key():
     ] is False
 
 
-def test_replacement_selection_uses_owner_setting_not_stock_enabled_flag():
+def test_replacement_selection_requires_explicit_owner_activation():
     home = Path(os.environ["HERMES_HOME"])
     _write_plugin(
         home,
@@ -861,22 +861,22 @@ def test_replacement_selection_uses_owner_setting_not_stock_enabled_flag():
         home,
         ["broker-plugin"],
         grants={"broker-plugin": ["vault.login_backend_replace"]},
-        vault={"bitwarden": {"enabled": False}},
     )
     manager = PluginManager()
     manager.discover_and_load()
     module = manager._plugins["broker-plugin"].module
 
     with patch("agent.vault_backends.base.is_installed", return_value=True):
+        inactive = next(
+            backend for backend in enabled_backends() if backend.name == "bitwarden"
+        )
+        assert inactive.display_name == "Bitwarden"
+
+        module.set_active("bitwarden", True)
         active = next(
             backend for backend in enabled_backends() if backend.name == "bitwarden"
         )
         assert active.display_name == "Broker Bitwarden"
-
-        module.set_active("bitwarden", False)
-        assert all(
-            backend.name != "bitwarden" for backend in enabled_backends()
-        )
 
 
 @pytest.mark.parametrize(
@@ -1085,6 +1085,8 @@ def test_login_backend_stock_replacement_occupies_stock_slot_without_changing_to
 
     manager = PluginManager()
     manager.discover_and_load()
+    module = manager._plugins["broker-bitwarden"].module
+    module.set_active("bitwarden", True)
 
     with patch("agent.vault_backends.base.is_installed", return_value=True):
         backends = enabled_backends()

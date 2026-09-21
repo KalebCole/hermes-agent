@@ -644,8 +644,10 @@ through managed-scope rules, holds `_locked_plugin_state(config_path)` and
 never catches write exceptions. It may mutate the raw mapping and call
 `save_config(..., strip_defaults=False)` so exact stock-key absence can be
 restored. The provider record carries the owning plugin id so vault resolution
-can select the replacement only when `settings.login_backend_enabled` is not
-false. When active, `vault.<stock>.enabled` applies to the stock backend and
+can select the replacement only when the raw owner setting
+`settings.login_backend_enabled` is exactly `true`. Missing, false, malformed,
+or unreadable settings leave it inactive, and plugin manifest defaults are not
+consulted. When active, `vault.<stock>.enabled` applies to the stock backend and
 does not suppress the replacement.
 
 - [ ] **Step 6: Run the focused tests and verify GREEN**

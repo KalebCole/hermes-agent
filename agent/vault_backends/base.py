@@ -158,16 +158,16 @@ def available_backend_providers() -> tuple["LoginBackendProvider", ...]:
 def _replacement_is_active(provider: "LoginBackendProvider") -> bool:
     if not provider.replaces_stock or provider.owner_plugin_id is None:
         return False
-    from hermes_cli.config import load_config_readonly
+    from hermes_cli.config import read_raw_config_readonly
 
-    config = load_config_readonly() or {}
+    config = read_raw_config_readonly()
     plugins = config.get("plugins")
     entries = plugins.get("entries") if isinstance(plugins, dict) else None
     entry = entries.get(provider.owner_plugin_id) if isinstance(entries, dict) else None
     settings = entry.get("settings") if isinstance(entry, dict) else None
-    return not (
+    return (
         isinstance(settings, dict)
-        and settings.get("login_backend_enabled") is False
+        and settings.get("login_backend_enabled") is True
     )
 
 
