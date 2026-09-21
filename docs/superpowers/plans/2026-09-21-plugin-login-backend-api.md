@@ -536,3 +536,142 @@ gh pr create \
 
 The PR body must state the API signature, fail-closed replacement contract, test commands, and non-goals. If direct upstream creation is rejected by permissions, create the same head-to-base PR through the normal fork flow and report the exact URL and error context.
 
+### Task 6: Add native unlock and transactional replacement activation
+
+**Files:**
+- Modify: `agent/vault_backends/base.py`
+- Modify: `agent/vault_backends/registry.py`
+- Modify: `hermes_cli/plugins.py`
+- Modify: `tools/browser_vault_tool.py`
+- Modify: `tests/hermes_cli/test_plugins_login_backend_registration.py`
+- Modify: `website/docs/developer-guide/plugins/index.md`
+
+**Interfaces:**
+- Consumes: The scoped login-backend provider registry and `PluginContext.register_login_backend`.
+- Produces:
+  - `LoginBackend.unlock_noninteractive() -> bool`
+  - `PluginContext.set_login_backend_active(name: str, active: bool) -> None`
+  - Generic list, unlock, fill, and rejected-session refresh behavior for native/passwordless backends.
+
+- [ ] **Step 1: Write failing real-discovery integration tests**
+
+Create a real plugin backend with `needs_unlock = True` that implements:
+
+```python
+def unlock_noninteractive(self) -> bool:
+    self.session_valid = True
+    return True
+```
+
+Through `PluginManager.discover_and_load()`, assert:
+
+- `browser_vault_list()` calls native unlock and returns metadata without a prompt.
+- `browser_vault_unlock("broker")` succeeds in a headless session without a prompt or secret argument.
+- `browser_vault_fill()` retries once after `get_meta()` or `resolve_password()` raises `UnlockRequired` for a rejected session, refreshes through `unlock_noninteractive()`, and fills without prompt data in tool input or output.
+- Stock Bitwarden still uses its existing interactive unlock behavior.
+
+- [ ] **Step 2: Run the native-unlock tests and verify RED**
+
+Run:
+
+```bash
+scripts/run_tests.sh tests/hermes_cli/test_plugins_login_backend_registration.py -k noninteractive
+```
+
+Expected: FAIL because `LoginBackend.unlock_noninteractive()` and the generic tool flow do not exist.
+
+- [ ] **Step 3: Add the default native-unlock method and generic tool flow**
+
+Add this backward-compatible default:
+
+```python
+def unlock_noninteractive(self) -> bool:
+    """Try a backend-owned unlock or session refresh without user secret input."""
+    return False
+```
+
+Before reporting a backend as locked or prompting, `browser_vault_list()`, `browser_vault_unlock()`, and `browser_vault_fill()` must call this method. If `get_meta()` or secret resolution raises `UnlockRequired`, call the method and retry the rejected operation once. Never pass a password, OTP, or other secret into the method. Keep the browser tool schemas unchanged.
+
+- [ ] **Step 4: Write failing transactional activation tests**
+
+Through real discovery of a capability-approved stock Bitwarden replacement, assert:
+
+```python
+ctx.set_login_backend_active("bitwarden", True)
+```
+
+atomically persists:
+
+```yaml
+plugins:
+  entries:
+    broker-plugin:
+      settings:
+        login_backend_enabled: true
+vault:
+  bitwarden:
+    enabled: false
+```
+
+Use the dynamic rollback key
+`plugins.entries.<plugin_id>.settings.prior_stock_<backend_name>`. Assert the
+first activation snapshots the raw stock key as
+`{present: bool, value?: Any}`, enables the replacement, and disables the stock
+backend in one atomic write. Cover prior stock values `true`, `false`, and
+absent. Repeated activation must be a no-op that does not replace the snapshot.
+Deactivation must restore the exact raw value or exact absence and consume a
+valid snapshot in the same write; without a valid snapshot it must not touch the
+stock key. Repeated deactivation must be a no-op that never overwrites a later
+user change. Assert unrelated raw config survives. Assert a managed install,
+any of the three exact managed paths (active, rollback, or stock), malformed
+config, or a save exception raises and leaves the file unchanged. Assert a
+plugin cannot activate a backend registration it does not own or a
+non-replacement backend.
+
+- [ ] **Step 5: Implement the narrow activation API**
+
+Add:
+
+```python
+def set_login_backend_active(self, name: str, active: bool) -> None:
+    ...
+```
+
+The method may target only this plugin's active `replace_stock=True`
+registration. It validates the active, dynamic rollback, and stock dotted paths
+through managed-scope rules, holds `_locked_plugin_state(config_path)` and
+`_CONFIG_LOCK` across a fail-closed raw read plus one atomic config write, and
+never catches write exceptions. It may mutate the raw mapping and call
+`save_config(..., strip_defaults=False)` so exact stock-key absence can be
+restored. The provider record carries the owning plugin id so vault resolution
+can select the replacement only when `settings.login_backend_enabled` is not
+false. When active, `vault.<stock>.enabled` applies to the stock backend and
+does not suppress the replacement.
+
+- [ ] **Step 6: Run the focused tests and verify GREEN**
+
+Run:
+
+```bash
+scripts/run_tests.sh tests/hermes_cli/test_plugins_login_backend_registration.py tests/tools/test_browser_vault.py
+```
+
+Expected: PASS.
+
+- [ ] **Step 7: Document and validate the final APIs**
+
+Document `unlock_noninteractive()` and `set_login_backend_active()` with their no-secret, managed-scope, atomic-write, rollback, and ownership rules. Then run:
+
+```bash
+scripts/run_tests.sh \
+  tests/agent/test_vault_backend_registry.py \
+  tests/agent/test_vault_backends.py \
+  tests/hermes_cli/test_plugins_login_backend_registration.py \
+  tests/tools/test_browser_vault.py
+ruff check agent/vault_backends hermes_cli/plugins.py tools/browser_vault_tool.py tests/hermes_cli/test_plugins_login_backend_registration.py
+python -m compileall -q agent/vault_backends hermes_cli/plugins.py tools/browser_vault_tool.py
+python scripts/check_compat_pointers.py
+git --no-pager diff --check
+```
+
+Expected: all commands pass.

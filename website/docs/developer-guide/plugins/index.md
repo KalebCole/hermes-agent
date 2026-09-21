@@ -1091,18 +1091,27 @@ def set_login_backend_active(self, name: str, active: bool) -> None:
 ```
 
 The call is valid only for the calling plugin's currently registered
-`replace_stock=True` provider. Activation writes
-`plugins.entries.<plugin_id>.settings.login_backend_enabled: true` and
-`vault.<name>.enabled: false`; deactivation writes the inverse. The provider
-registry records the owner, and selection uses the replacement unless that
-owner setting is explicitly `false`. While the replacement is active, the
+`replace_stock=True` provider. On the first activation, Hermes snapshots the
+raw stock setting under
+`plugins.entries.<plugin_id>.settings.prior_stock_<name>` as
+`{present: bool, value?: Any}`, writes `login_backend_enabled: true`, and writes
+`vault.<name>.enabled: false`. Repeated activation is a no-op and does not
+replace that snapshot.
+
+Deactivation writes `login_backend_enabled: false`, restores the exact prior
+stock value or its exact absence when a valid snapshot exists, and consumes the
+snapshot. Without a valid snapshot it leaves the stock key untouched. Repeated
+deactivation is a no-op, so later user changes are never overwritten. The
+provider registry records the owner, and selection uses the replacement unless
+that owner setting is explicitly `false`. While the replacement is active, the
 stock vault's disabled flag does not suppress it.
 
-Both affected dotted paths must be writable under managed-scope policy, and
-managed installs reject the operation. Hermes holds the existing plugin-state
-and config locks across a fail-closed raw read and one merge save, so unrelated
-configuration survives. Malformed YAML, policy rejection, or save failure
-raises without changing `config.yaml`; there is no silent fallback.
+The active, rollback, and stock dotted paths must all be writable under
+managed-scope policy, and managed installs reject the operation. Hermes holds
+the existing plugin-state and config locks across a fail-closed raw read and one
+atomic full-config save, so unrelated raw configuration survives. Malformed
+YAML, policy rejection, or save failure raises without changing `config.yaml`;
+there is no silent fallback.
 
 ### Register multiple hooks
 

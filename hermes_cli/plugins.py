@@ -628,6 +628,7 @@ class PluginContext:
             "settings",
             "login_backend_enabled",
         )
+        rollback_path = plugin_path[:-1] + (f"prior_stock_{provider.name}",)
         vault_path = ("vault", provider.name, "enabled")
         config_path = config_mod.get_config_path()
         with _locked_plugin_state(config_path), config_mod._CONFIG_LOCK:
@@ -635,27 +636,67 @@ class PluginContext:
                 raise PermissionError(
                     "Login backend activation cannot be changed in a managed install"
                 )
-            for path in (plugin_path, vault_path):
+            for path in (plugin_path, rollback_path, vault_path):
                 dotted_path = ".".join(path)
                 if managed_scope.is_key_managed(dotted_path):
                     raise PermissionError(
                         f"Login backend setting {dotted_path!r} is administrator-managed"
                     )
-            config_mod.read_user_config_raw(config_path)
-            partial = {
-                "plugins": {
-                    "entries": {
-                        self.plugin_id: {
-                            "settings": {"login_backend_enabled": active}
-                        }
-                    }
-                },
-                "vault": {provider.name: {"enabled": not active}},
-            }
+            raw = config_mod.read_user_config_raw(config_path)
+            missing = object()
+
+            def get_raw(path: tuple[str, ...]) -> Any:
+                node: Any = raw
+                for key in path:
+                    if not isinstance(node, dict) or key not in node:
+                        return missing
+                    node = node[key]
+                return node
+
+            def set_raw(path: tuple[str, ...], value: Any) -> None:
+                node = raw
+                for key in path[:-1]:
+                    child = node.get(key)
+                    if not isinstance(child, dict):
+                        child = {}
+                        node[key] = child
+                    node = child
+                node[path[-1]] = value
+
+            current = get_raw(plugin_path)
+            if current is active:
+                return
+
+            if active:
+                stock_value = get_raw(vault_path)
+                snapshot = {"present": stock_value is not missing}
+                if stock_value is not missing:
+                    snapshot["value"] = stock_value
+                set_raw(rollback_path, snapshot)
+                set_raw(plugin_path, True)
+                set_raw(vault_path, False)
+            else:
+                set_raw(plugin_path, False)
+                snapshot = get_raw(rollback_path)
+                valid_snapshot = (
+                    isinstance(snapshot, dict)
+                    and type(snapshot.get("present")) is bool
+                    and (not snapshot["present"] or "value" in snapshot)
+                )
+                if valid_snapshot:
+                    if snapshot["present"]:
+                        set_raw(vault_path, snapshot["value"])
+                    else:
+                        vault_section = get_raw(vault_path[:-1])
+                        if isinstance(vault_section, dict):
+                            vault_section.pop(vault_path[-1], None)
+                    settings = get_raw(rollback_path[:-1])
+                    if isinstance(settings, dict):
+                        settings.pop(rollback_path[-1], None)
+
             config_mod.save_config(
-                partial,
-                preserve_keys={plugin_path, vault_path},
-                merge_existing=True,
+                raw,
+                strip_defaults=False,
             )
 
     def call_mcp(
