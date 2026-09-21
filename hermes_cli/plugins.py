@@ -642,28 +642,88 @@ class PluginContext:
                     raise PermissionError(
                         f"Login backend setting {dotted_path!r} is administrator-managed"
                     )
-            raw = config_mod.read_user_config_raw(config_path)
+            try:
+                raw = config_mod.require_readable_config_before_write(config_path)
+            except RuntimeError as exc:
+                if isinstance(exc.__cause__, TypeError):
+                    raise TypeError(
+                        "Login backend activation config root must be a mapping"
+                    ) from exc
+                raise
             missing = object()
 
             def get_raw(path: tuple[str, ...]) -> Any:
                 node: Any = raw
                 for key in path:
-                    if not isinstance(node, dict) or key not in node:
+                    if not isinstance(node, Mapping) or key not in node:
                         return missing
                     node = node[key]
                 return node
+
+            def validate_parent_path(path: tuple[str, ...]) -> None:
+                node: Any = raw
+                traversed: list[str] = []
+                for key in path:
+                    if not isinstance(node, Mapping):
+                        dotted_path = ".".join(traversed) or "<config root>"
+                        raise TypeError(
+                            f"Login backend activation path {dotted_path!r} "
+                            "must be a mapping"
+                        )
+                    if key not in node:
+                        return
+                    node = node[key]
+                    traversed.append(key)
+                if not isinstance(node, Mapping):
+                    dotted_path = ".".join(traversed)
+                    raise TypeError(
+                        f"Login backend activation path {dotted_path!r} "
+                        "must be a mapping"
+                    )
 
             def set_raw(path: tuple[str, ...], value: Any) -> None:
                 node = raw
                 for key in path[:-1]:
                     child = node.get(key)
-                    if not isinstance(child, dict):
+                    if child is None:
                         child = {}
                         node[key] = child
                     node = child
                 node[path[-1]] = value
 
+            for path in (plugin_path[:-1], rollback_path[:-1], vault_path[:-1]):
+                validate_parent_path(path)
+
             current = get_raw(plugin_path)
+            if current is not missing and type(current) is not bool:
+                raise TypeError(
+                    f"Login backend setting {'.'.join(plugin_path)!r} must be a bool"
+                )
+
+            snapshot = get_raw(rollback_path)
+            if snapshot is not missing:
+                rollback_name = ".".join(rollback_path)
+                if not isinstance(snapshot, Mapping):
+                    raise TypeError(
+                        f"Login backend snapshot {rollback_name!r} must be a mapping"
+                    )
+                present = snapshot.get("present", missing)
+                if type(present) is not bool:
+                    raise TypeError(
+                        f"Login backend snapshot {rollback_name!r} must contain "
+                        "a bool 'present'"
+                    )
+                expected_keys = {"present", "value"} if present else {"present"}
+                if set(snapshot) != expected_keys:
+                    value_rule = (
+                        "contain exactly 'present' and 'value'"
+                        if present
+                        else "contain only 'present'"
+                    )
+                    raise ValueError(
+                        f"Login backend snapshot {rollback_name!r} must {value_rule}"
+                    )
+
             if current is active:
                 return
 
@@ -677,21 +737,15 @@ class PluginContext:
                 set_raw(vault_path, False)
             else:
                 set_raw(plugin_path, False)
-                snapshot = get_raw(rollback_path)
-                valid_snapshot = (
-                    isinstance(snapshot, dict)
-                    and type(snapshot.get("present")) is bool
-                    and (not snapshot["present"] or "value" in snapshot)
-                )
-                if valid_snapshot:
+                if snapshot is not missing:
                     if snapshot["present"]:
                         set_raw(vault_path, snapshot["value"])
                     else:
                         vault_section = get_raw(vault_path[:-1])
-                        if isinstance(vault_section, dict):
+                        if isinstance(vault_section, Mapping):
                             vault_section.pop(vault_path[-1], None)
                     settings = get_raw(rollback_path[:-1])
-                    if isinstance(settings, dict):
+                    if isinstance(settings, Mapping):
                         settings.pop(rollback_path[-1], None)
 
             config_mod.save_config(

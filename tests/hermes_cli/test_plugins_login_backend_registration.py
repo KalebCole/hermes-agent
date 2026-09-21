@@ -982,6 +982,144 @@ def test_replacement_activation_parse_failure_leaves_config_unchanged():
     assert path.read_text(encoding="utf-8") == broken
 
 
+def _replacement_activation_subject() -> tuple[object, Path]:
+    home = Path(os.environ["HERMES_HOME"])
+    _write_plugin(
+        home,
+        "broker-plugin",
+        backend_name="bitwarden",
+        display_name="Broker Bitwarden",
+        prefix="bw:",
+        replace_stock=True,
+        class_name="BrokerBitwardenBackend",
+    )
+    _configure_plugins(
+        home,
+        ["broker-plugin"],
+        grants={"broker-plugin": ["vault.login_backend_replace"]},
+        vault={"bitwarden": {"enabled": True}},
+    )
+    manager = PluginManager()
+    manager.discover_and_load()
+    return manager._plugins["broker-plugin"].module, home / "config.yaml"
+
+
+@pytest.mark.parametrize("active", [True, False])
+@pytest.mark.parametrize(
+    ("path", "malformed"),
+    [
+        ((), []),
+        (("plugins",), []),
+        (("plugins", "entries"), "entries"),
+        (("plugins", "entries", "broker-plugin"), 1),
+        (("plugins", "entries", "broker-plugin", "settings"), []),
+        (("vault",), "vault"),
+        (("vault", "bitwarden"), []),
+    ],
+)
+def test_replacement_activation_rejects_malformed_relevant_parent_without_writing(
+    path: tuple[str, ...],
+    malformed: object,
+    active: bool,
+):
+    from hermes_cli import config as config_mod
+
+    module, config_path = _replacement_activation_subject()
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    if path:
+        node = raw
+        for key in path[:-1]:
+            node = node[key]
+        node[path[-1]] = malformed
+    else:
+        raw = malformed
+    config_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    before = config_path.read_bytes()
+
+    with patch.object(config_mod, "save_config") as save_config, pytest.raises(
+        TypeError, match="must be a mapping"
+    ):
+        module.set_active("bitwarden", active)
+
+    save_config.assert_not_called()
+    assert config_path.read_bytes() == before
+
+
+@pytest.mark.parametrize("active", [True, False])
+@pytest.mark.parametrize("malformed", [None, 0, "true", []])
+def test_replacement_activation_rejects_malformed_active_value_without_writing(
+    malformed: object,
+    active: bool,
+):
+    from hermes_cli import config as config_mod
+
+    module, config_path = _replacement_activation_subject()
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    settings = raw["plugins"]["entries"]["broker-plugin"].setdefault("settings", {})
+    settings["login_backend_enabled"] = malformed
+    config_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    before = config_path.read_bytes()
+
+    with patch.object(config_mod, "save_config") as save_config, pytest.raises(
+        TypeError, match="login_backend_enabled.*bool"
+    ):
+        module.set_active("bitwarden", active)
+
+    save_config.assert_not_called()
+    assert config_path.read_bytes() == before
+
+
+@pytest.mark.parametrize("active", [True, False])
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        [],
+        {},
+        {"present": "true"},
+        {"present": True},
+        {"present": False, "value": True},
+        {"present": False, "unexpected": True},
+        {"present": True, "value": False, "unexpected": True},
+    ],
+)
+def test_replacement_activation_rejects_malformed_snapshot_without_writing(
+    malformed: object,
+    active: bool,
+):
+    from hermes_cli import config as config_mod
+
+    module, config_path = _replacement_activation_subject()
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    settings = raw["plugins"]["entries"]["broker-plugin"].setdefault("settings", {})
+    settings["login_backend_enabled"] = not active
+    settings["prior_stock_bitwarden"] = malformed
+    config_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    before = config_path.read_bytes()
+
+    with patch.object(config_mod, "save_config") as save_config, pytest.raises(
+        (TypeError, ValueError), match="prior_stock_bitwarden"
+    ):
+        module.set_active("bitwarden", active)
+
+    save_config.assert_not_called()
+    assert config_path.read_bytes() == before
+
+
+def test_replacement_activation_ignores_unrelated_malformed_section():
+    module, config_path = _replacement_activation_subject()
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    raw["display"] = []
+    config_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+
+    module.set_active("bitwarden", True)
+
+    saved = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert saved["display"] == []
+    assert saved["plugins"]["entries"]["broker-plugin"]["settings"][
+        "login_backend_enabled"
+    ] is True
+
+
 def test_replacement_activation_save_failure_leaves_config_unchanged():
     from hermes_cli import config as config_mod
 
