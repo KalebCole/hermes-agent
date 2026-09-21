@@ -1089,6 +1089,66 @@ def test_targeted_or_force_unload_aborts_before_disposal_on_malformed_state(
     ) is not None
 
 
+@pytest.mark.parametrize("action", ["targeted", "force"])
+@pytest.mark.parametrize(
+    "container_path",
+    [
+        ("plugins",),
+        ("plugins", "entries"),
+        ("plugins", "entries", "dual-broker"),
+        ("plugins", "entries", "dual-broker", "settings"),
+        (
+            "plugins",
+            "entries",
+            "dual-broker",
+            "settings",
+            "login_backends",
+        ),
+        (
+            "plugins",
+            "entries",
+            "dual-broker",
+            "settings",
+            "login_backends",
+            "bitwarden",
+        ),
+    ],
+    ids=[
+        "plugins",
+        "entries",
+        "plugin-entry",
+        "settings",
+        "login-backends",
+        "backend-state",
+    ],
+)
+def test_targeted_and_force_unload_validate_replacement_parent_mappings(
+    action: str,
+    container_path: tuple[str, ...],
+):
+    manager, _, config_path = _active_dual_replacement_manager(
+        Path(os.environ["HERMES_HOME"])
+    )
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    parent = raw
+    for key in container_path[:-1]:
+        parent = parent[key]
+    parent[container_path[-1]] = []
+    config_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    before = config_path.read_bytes()
+
+    with pytest.raises(TypeError, match="activation path"):
+        if action == "force":
+            manager.discover_and_load(force=True)
+        else:
+            manager.unload("dual-broker")
+
+    assert config_path.read_bytes() == before
+    assert login_backend_registry.snapshot_registration(
+        "bitwarden", scope=manager.scope_key
+    ) is not None
+
+
 def test_routine_unload_all_does_not_read_activation_config():
     manager, _, config_path = _active_dual_replacement_manager(
         Path(os.environ["HERMES_HOME"])

@@ -534,6 +534,49 @@ Final combined verification ran all eight listed test files in one invocation:
 
 None.
 
+## Remaining Important finding — carryover parent validation
+
+`capture_carryovers()` now reuses the strict activation parent-mapping
+validation before reading each current candidate's active and rollback values.
+Targeted unload and force rediscovery therefore raise before disposal when a
+relevant `plugins`, `entries`, plugin entry, `settings`, `login_backends`, or
+backend-state container is malformed. Routine non-force unload-all remains
+config-blind and non-mutating.
+
+### TDD evidence
+
+RED:
+
+```bash
+scripts/run_tests.sh tests/hermes_cli/test_plugins_login_backend_registration.py \
+  -k 'validate_replacement_parent_mappings' --tb=short
+```
+
+Result before implementation: all 12 targeted/force cases failed with
+`Failed: DID NOT RAISE TypeError`.
+
+GREEN:
+
+```text
+12 tests passed, 0 failed
+```
+
+Every parameterized case also asserts the registration remains live and config
+bytes remain unchanged.
+
+### Verification evidence
+
+- Focused login-backend suites: `123 passed, 0 failed`.
+- Relevant plugin/vault suites: `153 passed, 0 failed`.
+- Ruff: all checks passed.
+- `compileall`: exited zero.
+- Compatibility validation: no in-tree dependency on 2,087 pointers.
+- `git diff --check`: exited zero.
+
+### Concerns
+
+None.
+
 ## Final-review blocker follow-up
 
 Implemented the remaining lifecycle blockers:

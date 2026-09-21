@@ -310,6 +310,8 @@ def capture_carryovers(
         active_path, rollback_path, _ = state_paths(
             provider.owner_plugin_id, provider.name
         )
+        for path in (active_path[:-1], rollback_path[:-1]):
+            _validate_parent_path(raw, path)
         current_active = raw_value(raw, active_path, missing)
         if current_active is not missing and type(current_active) is not bool:
             raise TypeError(
