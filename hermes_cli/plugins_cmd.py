@@ -1011,8 +1011,11 @@ def cmd_remove(name: str) -> None:
     plugins_dir = _plugins_dir()
     target = _require_installed_plugin(name, plugins_dir, console)
     try:
+        from hermes_cli.plugins_login_backend import restore_plugin_leases
+
+        restore_plugin_leases(name)
         _remove_plugin_core(target)
-    except (OSError, PluginOperationError) as exc:
+    except (OSError, RuntimeError, TypeError, ValueError, PermissionError, PluginOperationError) as exc:
         _fail(console, f"[red]Error:[/red] Could not remove plugin '{name}': {exc}")
     console.print()
     console.print(f"[red]✗[/red] Plugin [bold]{name}[/bold] removed from {plugins_dir}")
@@ -1308,6 +1311,12 @@ def cmd_disable(name: str) -> None:
     key = _resolve_plugin_key(name)
     if key is None:
         _fail(console, _unknown_plugin_message(name))
+    try:
+        from hermes_cli.plugins_login_backend import restore_plugin_leases
+
+        restore_plugin_leases(key)
+    except (OSError, RuntimeError, TypeError, ValueError, PermissionError) as exc:
+        _fail(console, f"[red]Error:[/red] Could not disable plugin '{key}': {exc}")
     enabled = _get_enabled_set()
     disabled = _get_disabled_set()
     if key not in enabled and key in disabled:
@@ -1951,15 +1960,26 @@ def _toggle_plugin_toolset(name: str, *, enable: bool) -> None:
 
 def dashboard_set_agent_plugin_enabled(name: str, *, enabled: bool) -> dict[str, Any]:
     """Enable or disable a plugin in ``config.yaml`` (runtime allow/deny lists)."""
-    if _resolve_plugin_key(name) is None:
+    key = _resolve_plugin_key(name)
+    if key is None:
         return {"ok": False, "error": f"Plugin '{name}' is not installed or bundled."}
+    if not enabled:
+        try:
+            from hermes_cli.plugins_login_backend import restore_plugin_leases
+
+            restore_plugin_leases(key)
+        except (OSError, RuntimeError, TypeError, ValueError, PermissionError) as exc:
+            return {
+                "ok": False,
+                "error": f"Could not disable plugin '{key}': {exc}",
+            }
     en = _get_enabled_set()
     dis = _get_disabled_set()
-    if ((name in en and name not in dis) if enabled else (name not in en and name in dis)):
-        return {"ok": True, "name": name, "unchanged": True}
-    _set_plugin_enabled(name, enable=enabled)
-    _toggle_plugin_toolset(name, enable=enabled)
-    return {"ok": True, "name": name, "unchanged": False}
+    if ((key in en and key not in dis) if enabled else (key not in en and key in dis)):
+        return {"ok": True, "name": key, "unchanged": True}
+    _set_plugin_enabled(key, enable=enabled)
+    _toggle_plugin_toolset(key, enable=enabled)
+    return {"ok": True, "name": key, "unchanged": False}
 
 
 def _user_installed_plugin_dir(name: str) -> Optional[Path]:
@@ -2134,8 +2154,11 @@ def dashboard_remove_user_plugin(name: str) -> dict[str, Any]:
     if target is None:
         return {"ok": False, "error": f"Plugin '{name}' was not found under {plugins_dir}."}
     try:
+        from hermes_cli.plugins_login_backend import restore_plugin_leases
+
+        restore_plugin_leases(name)
         _remove_plugin_core(target)
-    except (OSError, PluginOperationError) as exc:
+    except (OSError, RuntimeError, TypeError, ValueError, PermissionError, PluginOperationError) as exc:
         return {"ok": False, "error": f"Could not remove plugin '{name}': {exc}"}
     return {"ok": True, "name": name}
 

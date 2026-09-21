@@ -1041,6 +1041,69 @@ def test_routine_unload_all_does_not_mutate_active_replacement_config():
     assert config_path.read_bytes() == before
 
 
+@pytest.mark.parametrize("force", [False, True])
+def test_targeted_or_force_unload_aborts_before_disposal_on_unreadable_state(
+    force: bool,
+):
+    manager, _, config_path = _active_dual_replacement_manager(
+        Path(os.environ["HERMES_HOME"])
+    )
+    broken = "plugins:\n  entries: [unterminated\n"
+    config_path.write_text(broken, encoding="utf-8")
+
+    with pytest.raises(Exception, match="while parsing|expected"):
+        if force:
+            manager.discover_and_load(force=True)
+        else:
+            manager.unload("dual-broker")
+
+    assert config_path.read_text(encoding="utf-8") == broken
+    assert login_backend_registry.snapshot_registration(
+        "bitwarden", scope=manager.scope_key
+    ) is not None
+
+
+@pytest.mark.parametrize("force", [False, True])
+def test_targeted_or_force_unload_aborts_before_disposal_on_malformed_state(
+    force: bool,
+):
+    manager, _, config_path = _active_dual_replacement_manager(
+        Path(os.environ["HERMES_HOME"])
+    )
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    raw["plugins"]["entries"]["dual-broker"]["settings"]["login_backends"][
+        "bitwarden"
+    ]["prior_stock"] = {"present": True}
+    config_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    before = config_path.read_bytes()
+
+    with pytest.raises(ValueError, match="prior_stock"):
+        if force:
+            manager.discover_and_load(force=True)
+        else:
+            manager.unload("dual-broker")
+
+    assert config_path.read_bytes() == before
+    assert login_backend_registry.snapshot_registration(
+        "bitwarden", scope=manager.scope_key
+    ) is not None
+
+
+def test_routine_unload_all_does_not_read_activation_config():
+    manager, _, config_path = _active_dual_replacement_manager(
+        Path(os.environ["HERMES_HOME"])
+    )
+    broken = "plugins:\n  entries: [unterminated\n"
+    config_path.write_text(broken, encoding="utf-8")
+
+    assert manager.unload() is True
+
+    assert config_path.read_text(encoding="utf-8") == broken
+    assert login_backend_registry.snapshot_registration(
+        "bitwarden", scope=manager.scope_key
+    ) is None
+
+
 def test_force_reload_omitting_active_replacement_restores_stock():
     home = Path(os.environ["HERMES_HOME"])
     manager, _, config_path = _active_dual_replacement_manager(home)
@@ -1097,6 +1160,137 @@ def test_successful_force_reload_preserves_active_replacement_snapshot():
         provider.name: provider for provider in available_backend_providers()
     }
     assert providers["bitwarden"].display_name == "Broker Bitwarden"
+
+
+def _prepare_different_owner_handoff(home: Path) -> tuple[PluginManager, Path]:
+    _write_plugin(
+        home,
+        "owner-a",
+        backend_name="bitwarden",
+        display_name="Owner A Bitwarden",
+        prefix="bw:",
+        replace_stock=True,
+        class_name="OwnerABitwardenBackend",
+    )
+    _write_plugin(
+        home,
+        "owner-b",
+        backend_name="bitwarden",
+        display_name="Owner B Bitwarden",
+        prefix="bw:",
+        replace_stock=True,
+        class_name="OwnerBBitwardenBackend",
+    )
+    _configure_plugins(
+        home,
+        ["owner-a"],
+        grants={
+            "owner-a": ["vault.login_backend_replace"],
+            "owner-b": ["vault.login_backend_replace"],
+        },
+        vault={"bitwarden": {"enabled": "original-stock"}},
+    )
+    manager = PluginManager()
+    manager.discover_and_load()
+    manager._plugins["owner-a"].module.set_active("bitwarden", True)
+    config_path = home / "config.yaml"
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    raw["plugins"]["enabled"] = ["owner-b"]
+    raw["plugins"]["entries"]["owner-b"]["settings"] = {
+        "login_backends": {
+            "bitwarden": {
+                "enabled": True,
+                "prior_stock": {"present": True, "value": False},
+            }
+        }
+    }
+    config_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    return manager, config_path
+
+
+def test_force_reload_hands_original_snapshot_to_different_active_owner():
+    manager, config_path = _prepare_different_owner_handoff(
+        Path(os.environ["HERMES_HOME"])
+    )
+
+    manager.discover_and_load(force=True)
+
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    state_a = raw["plugins"]["entries"]["owner-a"]["settings"]["login_backends"][
+        "bitwarden"
+    ]
+    state_b = raw["plugins"]["entries"]["owner-b"]["settings"]["login_backends"][
+        "bitwarden"
+    ]
+    assert state_a == {"enabled": False}
+    assert state_b == {
+        "enabled": True,
+        "prior_stock": {"present": True, "value": "original-stock"},
+    }
+    assert raw["vault"]["bitwarden"]["enabled"] is False
+    assert login_backend_registry.snapshot_registration(
+        "bitwarden", scope=manager.scope_key
+    ).owner_plugin_id == "owner-b"
+
+
+def test_different_owner_handoff_later_unload_restores_original_stock():
+    manager, config_path = _prepare_different_owner_handoff(
+        Path(os.environ["HERMES_HOME"])
+    )
+    manager.discover_and_load(force=True)
+
+    manager.unload("owner-b")
+
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert raw["vault"]["bitwarden"]["enabled"] == "original-stock"
+    state_b = raw["plugins"]["entries"]["owner-b"]["settings"]["login_backends"][
+        "bitwarden"
+    ]
+    assert state_b == {"enabled": False}
+
+
+def test_different_owner_handoff_rejects_stale_snapshot_without_writing():
+    manager, config_path = _prepare_different_owner_handoff(
+        Path(os.environ["HERMES_HOME"])
+    )
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    raw["plugins"]["entries"]["owner-b"]["settings"]["login_backends"][
+        "bitwarden"
+    ]["prior_stock"] = {"present": True, "value": "stale-generation"}
+    config_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+    before = config_path.read_bytes()
+
+    with pytest.raises(ValueError, match="stale"):
+        manager.discover_and_load(force=True)
+
+    assert config_path.read_bytes() == before
+
+
+def test_different_owner_handoff_is_profile_isolated():
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    root = Path(os.environ["HERMES_HOME"]).parent
+    home_a = root / "handoff-profile-a"
+    home_b = root / "handoff-profile-b"
+    token_a = set_hermes_home_override(home_a)
+    try:
+        manager_a, config_a = _prepare_different_owner_handoff(home_a)
+    finally:
+        reset_hermes_home_override(token_a)
+    token_b = set_hermes_home_override(home_b)
+    try:
+        _, config_b = _prepare_different_owner_handoff(home_b)
+        before_b = config_b.read_bytes()
+    finally:
+        reset_hermes_home_override(token_b)
+
+    manager_a.discover_and_load(force=True)
+
+    raw_a = yaml.safe_load(config_a.read_text(encoding="utf-8"))
+    assert raw_a["plugins"]["entries"]["owner-b"]["settings"]["login_backends"][
+        "bitwarden"
+    ]["prior_stock"]["value"] == "original-stock"
+    assert config_b.read_bytes() == before_b
 
 
 def test_repeated_cleanup_does_not_overwrite_later_user_change():

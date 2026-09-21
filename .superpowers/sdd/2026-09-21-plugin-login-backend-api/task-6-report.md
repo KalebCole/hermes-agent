@@ -533,3 +533,68 @@ Final combined verification ran all eight listed test files in one invocation:
 ### Concerns
 
 None.
+
+## Final-review blocker follow-up
+
+Implemented the remaining lifecycle blockers:
+
+- CLI and dashboard disable/remove restore persisted active stock-backend
+  replacement leases before changing plugin state or deleting files.
+- Targeted unload and force rediscovery now fail closed on unreadable or
+  malformed activation state before registration disposal; routine unload-all
+  does not read activation config.
+- Force reload can hand an active replacement from owner A to an explicitly
+  active owner B without briefly restoring stock, while preserving A's
+  original exact stock snapshot for B's later deactivation.
+
+### TDD evidence
+
+The new command/dashboard cleanup tests were run before implementation and
+failed as expected: `10 failed, 0 passed`. The failures showed leases remaining
+active, malformed state not aborting disable/remove, and unreadable state
+reaching the old mutation path. Targeted/force unload and different-owner
+handoff tests likewise failed against the previous lifecycle behavior.
+
+After implementation, the final focused verification was:
+
+```bash
+scripts/run_tests.sh \
+  tests/agent/test_vault_backends.py \
+  tests/agent/test_vault_backend_registry.py \
+  tests/hermes_cli/test_plugins.py \
+  tests/hermes_cli/test_plugins_cmd.py \
+  tests/hermes_cli/test_plugins_cmd_enable_disable_nested.py \
+  tests/hermes_cli/test_plugins_cmd_login_backend_cleanup.py \
+  tests/hermes_cli/test_plugins_login_backend_registration.py \
+  tests/hermes_cli/test_plugins_tts_registration.py \
+  tests/hermes_cli/test_plugins_transcription_registration.py \
+  -q --tb=short
+```
+
+Result: `279 passed, 0 failed`.
+
+Static verification:
+
+```bash
+.venv/bin/ruff check \
+  hermes_cli/plugins_login_backend.py \
+  hermes_cli/plugins_ledger.py \
+  hermes_cli/plugins_cmd.py \
+  tests/hermes_cli/test_plugins_cmd_login_backend_cleanup.py \
+  tests/hermes_cli/test_plugins_login_backend_registration.py
+.venv/bin/python -m compileall -q \
+  hermes_cli/plugins_login_backend.py \
+  hermes_cli/plugins_ledger.py \
+  hermes_cli/plugins_cmd.py \
+  tests/hermes_cli/test_plugins_cmd_login_backend_cleanup.py \
+  tests/hermes_cli/test_plugins_login_backend_registration.py
+.venv/bin/python scripts/check_compat_pointers.py
+git --no-pager diff --check
+```
+
+All exited zero. Compatibility validation again reported no in-tree dependency
+on the 2087 plugin-compat pointers.
+
+### Concerns
+
+None.

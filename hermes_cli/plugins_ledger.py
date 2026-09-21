@@ -252,17 +252,18 @@ class PluginLedgerMixin:
             registrations.extend(
                 r for key in target_keys for r in self._ownership_ledger.get(key, []) if r.persistent and r.active
             )
-        from hermes_cli.plugins_login_backend import (
-            capture_carryovers,
-            restore_carryovers,
-        )
-        login_backend_carryovers = capture_carryovers(self, registrations)
-        if unload_all and for_force_rediscovery:
-            self._login_backend_carryover.extend(login_backend_carryovers)
-        elif not unload_all:
-            restore_carryovers(
-                login_backend_carryovers, preserve_reregistered=False
+        if not unload_all or for_force_rediscovery:
+            from hermes_cli.plugins_login_backend import (
+                capture_carryovers,
+                restore_carryovers,
             )
+            login_backend_carryovers = capture_carryovers(self, registrations)
+            if unload_all:
+                self._login_backend_carryover.extend(login_backend_carryovers)
+            else:
+                restore_carryovers(
+                    login_backend_carryovers, preserve_reregistered=False
+                )
         found = bool(target_keys or registrations)
         self._dispose_registrations(registrations)
         self._forget_registrations(registrations)
